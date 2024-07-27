@@ -1,0 +1,71 @@
+[project]
+name = "textgres"
+version = "0.1.0"
+description = "A TUI for Postgres."
+authors = [
+    { name = "Devin Doolin", email = "devin@doolin.io" }
+]
+dependencies = [
+    "click==8.1.7",
+    "xdg-base-dirs==6.0.1",
+    "click-default-group==1.2.4",
+    "httpx[brotli]==0.27.0",
+    "pyperclip==1.8.2",
+    "pydantic==2.7.3",
+    "pyyaml==6.0.1",
+    "pydantic-settings==2.3.4",
+    "python-dotenv==1.0.1",
+    "textual-autocomplete>=3.0.0a9",
+    "textual[syntax]==0.73.0",
+]
+readme = "README.md"
+requires-python = ">= 3.12"
+license = { file = "LICENSE" }
+keywords = ["tui", "postgres", "client", "terminal", "textual", "cli", "textgres", "developer-tool"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12"
+]
+
+[project.urls]
+Homepage = "https://github.com/icdevin/textgres"
+Repository = "https://github.com/icdevin/textgres"
+Issues = "https://github.com/icdevin/textgres/issues"
+Documentation = "https://github.com/icdevin/textgres/blob/main/README.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+textgres = "textgres.__main__:cli"
+
+[tool.rye]
+managed = true
+dev-dependencies = [
+    "textual-dev>=1.5.1",
+    "pytest>=8.3.1",
+    "jinja2>=3.1.4",
+    "syrupy>=4.6.1",
+    "pytest-xdist>=3.6.1",
+    "pytest-cov>=5.0.0",
+    "pytest-textual-snapshot>=1.0.0",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/textgres"]
+
+[tool.pytest.ini_options]
+markers = [
+    "serial",  # used to indicate tests must not run in parallel
+]
+
+[tool.coverage.run]
+relative_files = true

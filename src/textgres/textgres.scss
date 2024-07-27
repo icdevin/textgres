@@ -1,0 +1,398 @@
+* {
+  scrollbar-color: $accent 30%;
+  scrollbar-color-hover: $accent 80%;
+  scrollbar-color-active: $accent;
+  scrollbar-background: $surface-darken-1;
+  scrollbar-background-hover: $surface-darken-1;
+  scrollbar-background-active: $surface-darken-1;
+  scrollbar-size-vertical: 1;
+
+  &:focus {
+    scrollbar-color: $accent 55%;
+  }
+}
+
+AutoComplete {
+  border-left: wide $accent;
+  background: $surface;
+
+  & AutoCompleteList {
+    color: $text-muted;
+    background: transparent;
+  }
+
+  & .autocomplete--highlight-match {
+    color: $text;
+    background: $primary-lighten-2;
+  }
+}
+
+Screen {
+  background: $background;
+}
+
+ModalScreen {
+  background: black 30%;
+}
+
+.section {
+  border: round $accent 35%;
+  border-title-color: $text;
+  border-title-align: right;
+
+  &:focus-within {
+    border: round $accent 100%;
+    border-title-color: $text;
+    border-title-style: b;
+  }
+}
+
+.hidden {
+  display: none;
+}
+
+.w-auto {
+  width: auto;
+}
+
+.dock-right {
+  dock: right;
+}
+
+.dock-left {
+  dock: left;
+}
+
+AppBody {
+  &.layout-horizontal {
+    layout: horizontal;
+
+    & KeyValueInput {
+      layout: vertical;
+      & Button {
+        width: 1fr;
+      }
+    }
+
+    & #option-description {
+      dock: bottom;
+      border-left: none;
+      border-top: $accent 30%;
+      height: auto;
+      width: 1fr;
+      max-width: 1fr;
+      padding: 0 1;
+    }
+
+  }
+
+  &.layout-vertical {
+    layout: vertical;
+
+    & KeyValueInput {
+      layout: horizontal;
+    }
+  }
+}
+
+Footer {
+  border: none;
+  height: 2;
+  padding: 0 2 1 2;
+  background: transparent;
+  margin: 0;
+
+  & FooterKey {
+    color: $text 85%;
+    background: transparent;
+
+    .footer-key--key {
+      color: $accent-lighten-1;
+      background: transparent;
+    }
+
+    &:hover {
+      color: $text 100%;
+    }
+  }
+}
+
+ContentTab {
+  padding: 0 1;
+  height: 1;
+  text-style: none;
+
+  &.-active {
+    text-style: b;
+  }
+}
+
+Tabs {
+  height: 2;
+
+  & #tabs-list {
+    min-height: 1;
+  }
+
+  &:focus {
+    & .underline--bar {
+      background: $accent 50%;
+    }
+  }
+}
+
+
+TabPane {
+  padding: 0;
+  height: 1fr;
+}
+
+DataTable {
+  scrollbar-gutter: stable;
+
+  & .datatable--header {
+    background: $boost;
+    color: $text;
+  }
+
+  &:focus {
+    .datatable--cursor {
+      background: $accent;
+      color: $text;
+    }
+
+    .datatable--fixed {
+      background: $primary 50%;
+      color: $text;
+    }
+
+    .datatable--fixed-cursor {
+      background: $accent-lighten-1;
+      color: $text;
+    }
+
+    .datatable--hover {
+      background: $primary-lighten-1 20%;
+      color: $text;
+    }
+  }
+
+  &:blur {
+    .datatable--cursor {
+      background: $primary-lighten-1 10%;
+      color: $text;
+    }
+
+    .datatable--fixed {
+      background: $primary 60%;
+      color: $text;
+    }
+
+    .datatable--fixed-cursor {
+      background: $primary 85%;
+      color: $text;
+    }
+
+    .datatable--hover {
+      background: $primary-lighten-1 40%;
+      color: $text;
+    }
+  }
+}
+
+
+TextArea {
+  height: 1fr;
+  border: none;
+  &:focus {
+      border: none;
+  }
+
+  & .text-area--cursor {
+    color: $text;
+    background: $accent;
+  }
+
+  &.empty {
+    & .text-area--cursor-line {
+      background: transparent;
+    }
+
+    & .text-area--cursor-gutter {
+      background: transparent;
+    }
+  }
+
+  &#description-textarea {
+    width: 100%;
+    height: 1fr;
+    padding: 0;
+    background: $surface;
+    padding-left: 1;
+    &:focus {
+      background: $surface-lighten-1;
+      border-left: outer $surface-lighten-2;
+      padding: 0;
+  }
+  }
+
+}
+
+
+
+Tree {
+  & > .tree--cursor {
+    text-style: b;
+    color: $text;
+    background: $panel-lighten-1 70%;
+  }
+  &:focus > .tree--cursor {
+    background: $accent;
+  }
+
+  & > .tree--highlight {
+    text-style: not underline;
+}
+}
+
+Input {
+  padding: 0 1;
+  height: 1;
+  background: $surface;
+  border: none;
+
+  &:focus {
+    background: $surface-lighten-1;
+    padding-left: 0;
+    border-left: outer $surface-lighten-2;
+
+    & .input--cursor {
+      color: $text;
+      background: $accent;
+      text-style: not reverse;
+    }
+
+  }
+}
+
+Button {
+  padding: 0 1;
+  height: 1;
+  border: none;
+
+  &:disabled {
+    opacity: 60%;
+  }
+}
+
+CommandPalette {
+  background: black 20%;
+
+  & > Vertical {
+    width: 50;
+    background: transparent;
+  }
+
+  & #--input {
+    border: none;
+    border-left: wide $accent;
+
+    & CommandInput {
+      height: auto;
+      border: none;
+      padding: 1 2;
+      background: transparent;
+    }
+
+    & SearchIcon {
+      display: none;
+      height: 1;
+    }
+  }
+
+  & #--results {
+    padding: 0;
+  }
+
+  & CommandList {
+    border: none;
+    border-left: wide $accent;
+    padding: 0;
+    padding-bottom: 1;
+    text-style: bold;
+  }
+
+  & > .command-palette--help-text {
+    background: transparent;
+    text-style: not b;
+  }
+}
+
+Select {
+  height: 1;
+  border: none;
+  padding: 0;
+
+  &:focus {
+    background: $accent-lighten-1;
+    color: $text;
+
+    & > SelectCurrent {
+      background: $accent-lighten-1;
+      color: $text;
+    }
+  }
+
+  & > SelectCurrent {
+    height: 1;
+    border: none;
+    padding: 0 1;
+  }
+
+  & > SelectOverlay {
+    padding: 0;
+    border: none;
+  }
+}
+
+.textual-jump-label {
+  layer: textual-jump;
+  dock: top;
+  background: $accent-lighten-2;
+  text-style: bold;
+  color: $text;
+}
+
+#textual-jump-info {
+  margin-bottom: 1;
+  dock: bottom;
+  height: 1;
+  width: 1fr;
+  background: $accent;
+  color: $text;
+  hatch: right $accent-darken-2;
+
+  & Label {
+    width: auto;
+    padding: 0 1;
+  }
+}
+
+#textual-jump-dismiss {
+  dock: bottom;
+  height: 1;
+  background: transparent;
+  color: $text-muted 42%;
+}
+
+Navigator {
+  &.section {
+    border-title-align: left;
+  }
+}
+
+Toast {
+  color: $text;
+  background: $secondary-background-darken-2;
+  border-right: none;
+}
