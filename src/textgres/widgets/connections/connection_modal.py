@@ -1,23 +1,17 @@
-from dataclasses import dataclass
-from textual import on
+from pydantic import ValidationError
+from textual import log, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label
+from typing import Optional
 
-@dataclass
-class NewConnectionData:
-    name: str
-    host: str
-    port: int
-    database: str
-    username: str
-    password: str
+from textgres.connection import Connection
 
-class NewConnectionModal(ModalScreen[NewConnectionData | None]):
+class ConnectionModal(ModalScreen[Optional[Connection]]):
     CSS = """
-    NewConnectionModal {
+    ConnectionModal {
         align: center middle;
 
         & > VerticalScroll {
@@ -68,27 +62,31 @@ class NewConnectionModal(ModalScreen[NewConnectionData | None]):
 
     def __init__(
         self,
-        name: str | None = None,
-        id: str | None = None,
-        classes: str | None = None,
+        connection: Optional[Connection] = None,
+        name: Optional[str] = None,
+        id: Optional[str] = None,
+        classes: Optional[str] = None,
     ) -> None:
         super().__init__(name, id, classes)
+        self.connection = connection or Connection()
 
     def compose(self) -> ComposeResult:
         with VerticalScroll() as vs:
             vs.can_focus = False
-            vs.border_title = "New Connection"
+            vs.border_title = "New Connection" if self.connection.id is None else "Edit Connection"
 
             yield Label("Name")
             yield Input(
-              placeholder="Local",
-              id="name-input",
+                self.connection.name,
+                placeholder="Enter a name for this connection, e.g. Development",
+                id="name-input",
             )
 
             with Horizontal(classes="host-group"):
                 with Vertical(classes="host"):
                     yield Label("Host")
                     yield Input(
+                        self.connection.host,
                         placeholder="localhost",
                         id="host-input",
                     )
@@ -96,6 +94,7 @@ class NewConnectionModal(ModalScreen[NewConnectionData | None]):
                 with Vertical(classes="port"):
                     yield Label("Port")
                     yield Input(
+                        str(self.connection.port),
                         placeholder="5432",
                         type="integer",
                         id="port-input",
@@ -103,20 +102,23 @@ class NewConnectionModal(ModalScreen[NewConnectionData | None]):
 
             yield Label("Database")
             yield Input(
-              placeholder="postgres",
-              id="database-input",
+                self.connection.database,
+                placeholder="postgres",
+                id="database-input",
             )
 
             yield Label("Username")
             yield Input(
-              placeholder="postgres",
-              id="username-input",
+                self.connection.username,
+                placeholder="postgres",
+                id="username-input",
             )
 
             yield Label("Password")
             yield Input(
-              password=True,
-              id="password-input",
+                self.connection.password,
+                password=True,
+                id="password-input",
             )
 
             yield Button.success("Save Connection", id="save-button")
@@ -135,13 +137,13 @@ class NewConnectionModal(ModalScreen[NewConnectionData | None]):
         self.save_connection()
 
     def save_connection(self) -> None:
-        self.dismiss(
-            NewConnectionData(
-                name=self.query_one("#name-input", Input).value,
-                host=self.query_one("#host-input", Input).value,
-                port=int(self.query_one("#port-input", Input).value),
-                database=self.query_one("#database-input", Input).value,
-                username=self.query_one("#username-input", Input).value,
-                password=self.query_one("#password-input", Input).value,
-            )
-        )
+        try:
+            self.connection.name = self.query_one("#name-input", Input).value
+            self.connection.host = self.query_one("#host-input", Input).value
+            self.connection.port = int(self.query_one("#port-input", Input).value)
+            self.connection.database = self.query_one("#database-input", Input).value
+            self.connection.username = self.query_one("#username-input", Input).value
+            self.connection.password = self.query_one("#password-input", Input).value
+            self.dismiss(self.connection)
+        except ValidationError as e:
+            log(e)

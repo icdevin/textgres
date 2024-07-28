@@ -1,11 +1,13 @@
 from pathlib import Path
 
+from textual import log
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Label
 
+from textgres.connection import Connection
 from textgres.widgets.connections.navigator import (
     ConnectionTree,
     Navigator
@@ -68,9 +70,6 @@ class MainScreen(Screen[None]):
 class Textgres(App[None]):
     CSS_PATH = Path(__file__).parent / "textgres.scss"
     BINDINGS = []
-
-    def __init__(self) -> None:
-        super().__init__()
 
     def get_default_screen(self) -> MainScreen:
         self.main_screen = MainScreen()

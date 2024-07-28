@@ -1,18 +1,19 @@
 from dataclasses import dataclass
 from rich.text import TextType
-from textual import on
+from textual import on, log
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import Reactive, reactive
 from textual.widgets import Static, Tree
 from textual.widgets.tree import TreeNode
+from typing import Optional
 
 from textgres.connection import Connection
 from textgres.widgets.tree import TextgresTree
-from textgres.widgets.connections.new_connection_modal import (
-  NewConnectionModal,
-  NewConnectionData
+from textgres.widgets.connections.connection_modal import (
+  ConnectionModal,
 )
 
 class ConnectionTree(TextgresTree[Connection]):
@@ -23,11 +24,11 @@ class ConnectionTree(TextgresTree[Connection]):
     def __init__(
         self,
         label: TextType,
-        data: Connection | None = None,
+        data: Optional[Connection] = None,
         *,
-        name: str | None = None,
-        id: str | None = None,
-        classes: str | None = None,
+        name: Optional[str] = None,
+        id: Optional[str] = None,
+        classes: Optional[str] = None,
         disabled: bool = False,
     ) -> None:
         super().__init__(
@@ -49,11 +50,22 @@ class ConnectionTree(TextgresTree[Connection]):
         def control(self) -> "ConnectionTree":
             return self.tree
 
-    currently_open: Reactive[TreeNode[Connection] | None] = reactive(None)
+    @dataclass
+    class ConnectionHighlighted(Message):
+        connection: Connection
+        node: TreeNode[Connection]
+        tree: "ConnectionTree"
 
-    def watch_currently_open(self, node: TreeNode[Connection] | None) -> None:
+        @property
+        def control(self) -> "ConnectionTree":
+            return self.tree
+
+    selected_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
+    highlighted_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
+
+    def watch_selected_node(self, node: Optional[TreeNode[Connection]]) -> None:
         if node and isinstance(node.data, Connection):
-            self.post_messsage(
+            self.post_message(
                 self.ConnectionSelected(
                     connection=node.data,
                     node=node,
@@ -61,35 +73,46 @@ class ConnectionTree(TextgresTree[Connection]):
                 )
             )
 
+    def watch_highlighted_node(self, node: Optional[TreeNode[Connection]]) -> None:
+        if node and isinstance(node.data, Connection):
+            self.post_message(
+                self.ConnectionHighlighted(
+                    connection=node.data,
+                    node=node,
+                    tree=self,
+                )
+            )
+
+    @on(Tree.NodeHighlighted)
+    def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
+        event.stop()
+        if isinstance(event.node.data, Connection):
+            self.highlighted_node = event.node
+        else:
+            self.highlighted_node = None
+
     @on(Tree.NodeSelected)
     def on_node_selected(self, event: Tree.NodeSelected[Connection]) -> None:
         event.stop()
         if isinstance(event.node.data, Connection):
-            self.currently_open = event.node
+            self.selected_node = event.node
             self.refresh()
 
     async def new_connection_flow(self) -> None:
         focused_before = self.screen.focused
         self.screen.set_focus(None)
 
-        def _handle_new_connection_data(new_connection_data: NewConnectionData | None) -> None:
-            if new_connection_data is None:
+        def _handle_new_connection_data(new_connection: Optional[Connection]) -> None:
+            if new_connection is None:
                 self.screen.set_focus(focused_before)
                 return
 
-            new_connection = Connection(
-                name=new_connection_data.name,
-                host=new_connection_data.host,
-                port=new_connection_data.port,
-                database=new_connection_data.database,
-                username=new_connection_data.username,
-            )
-
             new_node = self.add_connection(new_connection)
+            new_connection.save()
 
             self.notify(
                 title="Connection saved",
-                message=f"Connection \"{new_connection_data.name}\" saved.",
+                message=f"Connection \"{new_connection.name}\" saved.",
                 timeout=5,
             )
 
@@ -101,7 +124,7 @@ class ConnectionTree(TextgresTree[Connection]):
             self.call_after_refresh(post_new_connection)
 
         await self.app.push_screen(
-            NewConnectionModal(),
+            ConnectionModal(),
             callback=_handle_new_connection_data,
         )
 
@@ -127,17 +150,17 @@ class ConnectionPreview(VerticalScroll):
     }
     """
 
-    connection: Reactive[Connection | None] = reactive(None)
+    connection: Reactive[Optional[Connection]] = reactive(None)
 
     def compose(self) -> ComposeResult:
         self.can_focus = False
         yield Static("", id="host")
 
-    def watch_connection(self, connection: Connection | None) -> None:
+    def watch_connection(self, connection: Optional[Connection]) -> None:
         self.set_class(connection is None, "hidden")
         if connection:
             host = self.query_one("#host", Static)
-            host.update(connection.host)
+            host.update("{}:{}".format(connection.host, str(connection.port)))
 
 class Navigator(Vertical):
     DEFAULT_CSS = """
@@ -154,8 +177,11 @@ class Navigator(Vertical):
     }
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    BINDINGS = [
+        Binding("ctrl+e", "edit_connection", "Edit Connection")
+    ]
+
+    highlighted_connection: Reactive[Optional[Connection]] = reactive(None)
 
     def compose(self) -> ComposeResult:
         self.border_title = "Navigator"
@@ -169,13 +195,44 @@ class Navigator(Vertical):
         tree.show_guides = False
         tree.cursor_line = 0
 
+        self.connections = Connection.load()
+        for connection in self.connections:
+            tree.add_connection(connection)
+
         yield tree
         yield ConnectionPreview()
 
-    @on(ConnectionTree.ConnectionSelected)
-    def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
+    def on_mount(self) -> None:
+        if len(self.connections) > 0:
+            self.highlighted_connection = self.connections[0]
+
+    async def action_edit_connection(self) -> None:
+        log(self.highlighted_connection)
+        if self.highlighted_connection:
+            self.screen.set_focus(None)
+
+            def _handle_updated_connection(updated_connection: Optional[Connection]) -> None:
+                log(updated_connection)
+
+            await self.app.push_screen(
+                ConnectionModal(connection=self.highlighted_connection),
+                callback=_handle_updated_connection,
+            )
+
+    # @on(ConnectionTree.ConnectionSelected)
+    # def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
+    #     if isinstance(event.node.data, Connection):
+    #         self.connection_preview.connection = event.node.data
+
+    @on(ConnectionTree.ConnectionHighlighted)
+    def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
         if isinstance(event.node.data, Connection):
-            self.connection_preview.connection = event.node.data
+            self.highlighted_connection = event.node.data
+        else:
+            self.highlighted_connection = None
+
+    def watch_highlighted_connection(self, connection: Optional[Connection]) -> None:
+        self.connection_preview.connection = connection if connection else None
 
     @property
     def connection_preview(self) -> ConnectionPreview:
