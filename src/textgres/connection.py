@@ -1,5 +1,6 @@
 import sqlite3
 from pydantic import BaseModel, Field
+from textual import log
 
 def dict_factory(cursor, row):
     fields = [column[0] for column in cursor.description]
@@ -39,7 +40,7 @@ class Connection(BaseModel):
     def save(self) -> None:
         conn = sqlite3.connect("connections.db")
         c = conn.cursor()
-        if self.id:
+        if not self.id:
             c.execute(
                 "INSERT INTO connections VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (None, self.name, self.host, self.port, self.database, self.username, self.password),

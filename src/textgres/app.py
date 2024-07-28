@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from textual import log
+from textual import log, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -45,12 +45,6 @@ class AppBody(Vertical):
 
 class MainScreen(Screen[None]):
     AUTO_FOCUS = None
-    BINDINGS = [
-        Binding("ctrl+n", "new_connection", "New Connection"),
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
 
     def compose(self) -> ComposeResult:
         yield AppHeader()
@@ -60,8 +54,9 @@ class MainScreen(Screen[None]):
             yield ResultsArea()
         yield Footer()
 
-    async def action_new_connection(self) -> None:
-        await self.connection_tree.new_connection_flow()
+    @on(ConnectionTree.ConnectionSelected)
+    def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
+        log(event.connection)
 
     @property
     def connection_tree(self) -> ConnectionTree:

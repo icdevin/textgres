@@ -11,6 +11,7 @@ from textual.widgets.tree import TreeNode
 from typing import Optional
 
 from textgres.connection import Connection
+from textgres.widgets.confirm_modal import ConfirmModal
 from textgres.widgets.tree import TextgresTree
 from textgres.widgets.connections.connection_modal import (
   ConnectionModal,
@@ -107,8 +108,8 @@ class ConnectionTree(TextgresTree[Connection]):
                 self.screen.set_focus(focused_before)
                 return
 
-            new_node = self.add_connection(new_connection)
             new_connection.save()
+            new_node = self.add_connection(new_connection)
 
             self.notify(
                 title="Connection saved",
@@ -128,6 +129,55 @@ class ConnectionTree(TextgresTree[Connection]):
             callback=_handle_new_connection_data,
         )
 
+    async def edit_connection_flow(self) -> None:
+        if not self.highlighted_node:
+            return
+
+        def _handle_updated_connection_data(connection: Optional[Connection]) -> None:
+            if connection is None:
+                return
+
+            connection.save()
+            self.highlighted_node.data = connection
+            self.highlighted_node.set_label(connection.name)
+
+            self.notify(
+                title="Connection updated",
+                message=f"Connection \"{connection.name}\" updated.",
+                timeout=5,
+            )
+
+        await self.app.push_screen(
+            ConnectionModal(connection=self.highlighted_node.data),
+            callback=_handle_updated_connection_data,
+        )
+
+    async def delete_connection_flow(self) -> None:
+        if not self.highlighted_node:
+            return
+
+        connection = self.highlighted_node.data
+
+        def _handle_delete_connection_data(delete: bool) -> None:
+            if not delete:
+                return
+
+            connection.delete()
+            self.highlighted_node.remove()
+
+            self.notify(
+                title="Connection deleted",
+                message=f"Connection \"{connection.name}\" deleted.",
+                timeout=5,
+            )
+
+        await self.app.push_screen(
+            ConfirmModal(
+                message=f"Are you sure you want to delete connection \"{connection.name}\"?",
+            ),
+            callback=_handle_delete_connection_data,
+        )
+
     def add_connection(
         self,
         connection: Connection,
@@ -144,6 +194,7 @@ class ConnectionPreview(VerticalScroll):
         max-height: 50%;
         padding: 0 1;
         border-top: solid gray 35%;
+
         &.hidden {
             display: none;
         }
@@ -178,7 +229,9 @@ class Navigator(Vertical):
     """
 
     BINDINGS = [
-        Binding("ctrl+e", "edit_connection", "Edit Connection")
+        Binding("ctrl+n", "new_connection", "New Connection"),
+        Binding("ctrl+e", "edit_connection", "Edit Connection"),
+        Binding("backspace", "delete_connection", "Delete Connection")
     ]
 
     highlighted_connection: Reactive[Optional[Connection]] = reactive(None)
@@ -196,33 +249,22 @@ class Navigator(Vertical):
         tree.cursor_line = 0
 
         self.connections = Connection.load()
-        for connection in self.connections:
-            tree.add_connection(connection)
+        for i, connection in enumerate(self.connections):
+            node = tree.add_connection(connection)
+            if i == 0:
+                tree.highlighted_node = node
 
         yield tree
         yield ConnectionPreview()
 
-    def on_mount(self) -> None:
-        if len(self.connections) > 0:
-            self.highlighted_connection = self.connections[0]
+    async def action_new_connection(self) -> None:
+        await self.connection_tree.new_connection_flow()
 
     async def action_edit_connection(self) -> None:
-        log(self.highlighted_connection)
-        if self.highlighted_connection:
-            self.screen.set_focus(None)
+        await self.connection_tree.edit_connection_flow()
 
-            def _handle_updated_connection(updated_connection: Optional[Connection]) -> None:
-                log(updated_connection)
-
-            await self.app.push_screen(
-                ConnectionModal(connection=self.highlighted_connection),
-                callback=_handle_updated_connection,
-            )
-
-    # @on(ConnectionTree.ConnectionSelected)
-    # def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
-    #     if isinstance(event.node.data, Connection):
-    #         self.connection_preview.connection = event.node.data
+    async def action_delete_connection(self) -> None:
+        await self.connection_tree.delete_connection_flow()
 
     @on(ConnectionTree.ConnectionHighlighted)
     def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
