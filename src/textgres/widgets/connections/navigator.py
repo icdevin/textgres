@@ -49,16 +49,6 @@ class ConnectionTree(TextgresTree[Connection]):
         )
 
     @dataclass
-    class ConnectionSelected(Message):
-        connection: Connection
-        node: TreeNode[Connection]
-        tree: "ConnectionTree"
-
-        @property
-        def control(self) -> "ConnectionTree":
-            return self.tree
-
-    @dataclass
     class ConnectionHighlighted(Message):
         connection: Connection
         node: TreeNode[Connection]
@@ -69,57 +59,47 @@ class ConnectionTree(TextgresTree[Connection]):
             return self.tree
 
     connections: Reactive[list[Connection]] = reactive([])
-    selected_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
-    highlighted_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
 
     def watch_connections(self, connections: list[Connection]) -> None:
         self.clear()
         for connection in connections:
             self.add_connection(connection)
 
-    def watch_selected_node(self, node: Optional[TreeNode[Connection]]) -> None:
-        if node and isinstance(node.data, Connection):
-            self.post_message(
-                self.ConnectionSelected(
-                    connection=node.data,
-                    node=node,
-                    tree=self,
-                )
-            )
-
-    def watch_highlighted_node(self, node: Optional[TreeNode[Connection]]) -> None:
-        if node and isinstance(node.data, Connection):
-            self.post_message(
-                self.ConnectionHighlighted(
-                    connection=node.data,
-                    node=node,
-                    tree=self,
-                )
-            )
-
     @on(Tree.NodeExpanded)
     def on_node_expanded(self, event: Tree.NodeExpanded[Connection]) -> None:
-        # If the expanded node is top-level, i.e. it's a Connection,
-        # connect if not already connected
-        if event.node.parent is self.root:
+        if isinstance(event.node.data, Connection):
             connection = event.node.data
             if not connection.connected:
                 connection.connect()
 
     @on(Tree.NodeHighlighted)
     def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
-        event.stop()
         if isinstance(event.node.data, Connection):
             self.highlighted_node = event.node
+            self.post_message(
+                self.ConnectionHighlighted(
+                    connection=event.node.data,
+                    node=event.node,
+                    tree=self,
+                )
+            )
         else:
             self.highlighted_node = None
 
     @on(Tree.NodeSelected)
     def on_node_selected(self, event: Tree.NodeSelected[Connection]) -> None:
-        event.stop()
-        if isinstance(event.node.data, Connection):
-            self.selected_node = event.node
-            self.refresh()
+        connection = event.node.data
+
+        if not isinstance(event.node.data, Connection) or connection.connected:
+            return
+
+        connection.connect()
+        self.notify(
+            title="Connected",
+            message=f"Connected to \"{connection.name}\".",
+            timeout=5,
+        )
+        # self.refresh()
 
     async def action_new_connection(self) -> None:
         focused_before = self.screen.focused
@@ -207,6 +187,7 @@ class ConnectionTree(TextgresTree[Connection]):
         connection = self.highlighted_node.data
         if connection.connected:
             connection.disconnect()
+            self.highlighted_node.collapse()
             self.notify(
                 title="Disconnected",
                 message=f"Disconnected from \"{connection.name}\".",
@@ -286,16 +267,6 @@ class Navigator(Vertical):
             self.highlighted_connection = event.node.data
         else:
             self.highlighted_connection = None
-
-    @on(ConnectionTree.ConnectionSelected)
-    def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
-        connection = event.connection
-        connection.connect()
-        self.notify(
-            title="Connected",
-            message=f"Connected to \"{connection.name}\".",
-            timeout=5,
-        )
 
     @property
     def connection_preview(self) -> ConnectionPreview:
