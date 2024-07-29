@@ -234,6 +234,10 @@ class Navigator(Vertical):
         width: auto;
         max-width: 33%;
 
+        & .hidden {
+            display: none;
+        }
+
         & Tree {
             min-width: 20;
             background: transparent;

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from textual import log, on
+from textual import log
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -47,6 +47,10 @@ class AppBody(Vertical):
 class MainScreen(Screen[None]):
     AUTO_FOCUS = None
 
+    BINDINGS = [
+        Binding("ctrl+h", "toggle_navigator", "Show/Hide Navigator")
+    ]
+
     connections: Reactive[list[Connection]] = reactive([])
 
     def compose(self) -> ComposeResult:
@@ -56,6 +60,13 @@ class MainScreen(Screen[None]):
             yield QueryArea()
             yield ResultsArea()
         yield Footer()
+
+    def action_toggle_navigator(self) -> None:
+        self.navigator.toggle_class("hidden")
+
+    @property
+    def navigator(self) -> Navigator:
+        return self.query_one(Navigator)
 
 class Textgres(App[None]):
     CSS_PATH = Path(__file__).parent / "textgres.scss"
