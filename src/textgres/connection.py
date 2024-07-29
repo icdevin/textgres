@@ -1,6 +1,9 @@
+import psycopg2
 import sqlite3
+import psycopg2._psycopg
 from pydantic import BaseModel, Field
 from textual import log
+from typing import Optional
 
 def dict_factory(cursor, row):
     fields = [column[0] for column in cursor.description]
@@ -14,6 +17,8 @@ class Connection(BaseModel):
     database: str = Field(default="postgres")
     username: str = Field(default="postgres")
     password: str = Field(default="")
+
+    _conn = None
 
     def load():
         conn = sqlite3.connect("connections.db")
@@ -37,6 +42,33 @@ class Connection(BaseModel):
         conn.close()
         return [Connection(**connection) for connection in connections]
 
+    def connect(self):
+        if not self._conn:
+            log("Connecting '{}'".format(self.name))
+            self._conn = psycopg2.connect(
+                host=self.host,
+                port=self.port,
+                dbname=self.database,
+                user=self.username,
+                password=self.password,
+            )
+
+    def disconnect(self) -> None:
+        log("Disconnecting '{}'".format(self.name))
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def query(self, query: str):
+        if not self._conn:
+            self.connect()
+
+        log("Querying '{}'".format(self.name))
+        with self._conn.cursor() as cur:
+            cur.execute(query)
+            results = cur.fetchall()
+            log(results)
+
     def save(self) -> None:
         conn = sqlite3.connect("connections.db")
         c = conn.cursor()
@@ -59,3 +91,7 @@ class Connection(BaseModel):
         c.execute("DELETE FROM connections WHERE name = ?", (self.name,))
         conn.commit()
         conn.close()
+
+    @property
+    def connected(self) -> bool:
+        return self._conn is not None

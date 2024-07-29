@@ -18,6 +18,13 @@ from textgres.widgets.connections.connection_modal import (
 )
 
 class ConnectionTree(TextgresTree[Connection]):
+    BINDINGS = [
+        Binding("ctrl+n", "new_connection", "New Connection"),
+        Binding("ctrl+e", "edit_connection", "Edit Connection"),
+        Binding("backspace", "delete_connection", "Delete Connection"),
+        Binding("ctrl+d", "disconnect", "Disconnect")
+    ]
+
     COMPONENT_CLASSES = {
         "node-selected",
     }
@@ -61,8 +68,14 @@ class ConnectionTree(TextgresTree[Connection]):
         def control(self) -> "ConnectionTree":
             return self.tree
 
+    connections: Reactive[list[Connection]] = reactive([])
     selected_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
     highlighted_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
+
+    def watch_connections(self, connections: list[Connection]) -> None:
+        self.clear()
+        for connection in connections:
+            self.add_connection(connection)
 
     def watch_selected_node(self, node: Optional[TreeNode[Connection]]) -> None:
         if node and isinstance(node.data, Connection):
@@ -84,6 +97,15 @@ class ConnectionTree(TextgresTree[Connection]):
                 )
             )
 
+    @on(Tree.NodeExpanded)
+    def on_node_expanded(self, event: Tree.NodeExpanded[Connection]) -> None:
+        # If the expanded node is top-level, i.e. it's a Connection,
+        # connect if not already connected
+        if event.node.parent is self.root:
+            connection = event.node.data
+            if not connection.connected:
+                connection.connect()
+
     @on(Tree.NodeHighlighted)
     def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
         event.stop()
@@ -99,7 +121,7 @@ class ConnectionTree(TextgresTree[Connection]):
             self.selected_node = event.node
             self.refresh()
 
-    async def new_connection_flow(self) -> None:
+    async def action_new_connection(self) -> None:
         focused_before = self.screen.focused
         self.screen.set_focus(None)
 
@@ -129,7 +151,7 @@ class ConnectionTree(TextgresTree[Connection]):
             callback=_handle_new_connection_data,
         )
 
-    async def edit_connection_flow(self) -> None:
+    async def action_edit_connection(self) -> None:
         if not self.highlighted_node:
             return
 
@@ -152,7 +174,7 @@ class ConnectionTree(TextgresTree[Connection]):
             callback=_handle_updated_connection_data,
         )
 
-    async def delete_connection_flow(self) -> None:
+    async def action_delete_connection(self) -> None:
         if not self.highlighted_node:
             return
 
@@ -178,10 +200,20 @@ class ConnectionTree(TextgresTree[Connection]):
             callback=_handle_delete_connection_data,
         )
 
-    def add_connection(
-        self,
-        connection: Connection,
-    ) -> TreeNode[Connection]:
+    def action_disconnect(self) -> None:
+        if self.highlighted_node is None:
+            return
+
+        connection = self.highlighted_node.data
+        if connection.connected:
+            connection.disconnect()
+            self.notify(
+                title="Disconnected",
+                message=f"Disconnected from \"{connection.name}\".",
+                timeout=5,
+            )
+
+    def add_connection(self, connection: Connection) -> TreeNode[Connection]:
         return self.root.add(connection.name, data=connection)
 
 class ConnectionPreview(VerticalScroll):
@@ -228,43 +260,25 @@ class Navigator(Vertical):
     }
     """
 
-    BINDINGS = [
-        Binding("ctrl+n", "new_connection", "New Connection"),
-        Binding("ctrl+e", "edit_connection", "Edit Connection"),
-        Binding("backspace", "delete_connection", "Delete Connection")
-    ]
-
+    connections: Reactive[list[Connection]] = reactive([])
     highlighted_connection: Reactive[Optional[Connection]] = reactive(None)
+
+    def watch_highlighted_connection(self, connection: Optional[Connection]) -> None:
+        self.connection_preview.connection = connection or None
 
     def compose(self) -> ComposeResult:
         self.border_title = "Navigator"
         self.add_class("section")
 
-        tree = ConnectionTree(
-            label="connection"
-        )
+        tree = ConnectionTree(label="connection")
+        tree.data_bind(Navigator.connections)
         tree.guide_depth = 1
         tree.show_root = False
         tree.show_guides = False
         tree.cursor_line = 0
 
-        self.connections = Connection.load()
-        for i, connection in enumerate(self.connections):
-            node = tree.add_connection(connection)
-            if i == 0:
-                tree.highlighted_node = node
-
         yield tree
         yield ConnectionPreview()
-
-    async def action_new_connection(self) -> None:
-        await self.connection_tree.new_connection_flow()
-
-    async def action_edit_connection(self) -> None:
-        await self.connection_tree.edit_connection_flow()
-
-    async def action_delete_connection(self) -> None:
-        await self.connection_tree.delete_connection_flow()
 
     @on(ConnectionTree.ConnectionHighlighted)
     def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
@@ -273,8 +287,15 @@ class Navigator(Vertical):
         else:
             self.highlighted_connection = None
 
-    def watch_highlighted_connection(self, connection: Optional[Connection]) -> None:
-        self.connection_preview.connection = connection if connection else None
+    @on(ConnectionTree.ConnectionSelected)
+    def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
+        connection = event.connection
+        connection.connect()
+        self.notify(
+            title="Connected",
+            message=f"Connected to \"{connection.name}\".",
+            timeout=5,
+        )
 
     @property
     def connection_preview(self) -> ConnectionPreview:

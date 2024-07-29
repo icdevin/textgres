@@ -4,6 +4,7 @@ from textual import log, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.reactive import Reactive, reactive
 from textual.screen import Screen
 from textual.widgets import Footer, Label
 
@@ -46,28 +47,24 @@ class AppBody(Vertical):
 class MainScreen(Screen[None]):
     AUTO_FOCUS = None
 
+    connections: Reactive[list[Connection]] = reactive([])
+
     def compose(self) -> ComposeResult:
         yield AppHeader()
         with AppBody():
-            yield Navigator()
+            yield Navigator().data_bind(MainScreen.connections)
             yield QueryArea()
             yield ResultsArea()
         yield Footer()
-
-    @on(ConnectionTree.ConnectionSelected)
-    def on_connection_selected(self, event: ConnectionTree.ConnectionSelected) -> None:
-        log(event.connection)
-
-    @property
-    def connection_tree(self) -> ConnectionTree:
-        return self.query_one(ConnectionTree)
 
 class Textgres(App[None]):
     CSS_PATH = Path(__file__).parent / "textgres.scss"
     BINDINGS = []
 
+    connections: Reactive[list[Connection]] = reactive(Connection.load())
+
     def get_default_screen(self) -> MainScreen:
-        self.main_screen = MainScreen()
+        self.main_screen = MainScreen().data_bind(Textgres.connections)
         return self.main_screen
 
 if __name__ == "__main__":
