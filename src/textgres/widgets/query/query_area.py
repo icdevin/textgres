@@ -34,4 +34,3 @@ class QueryArea(Vertical):
     def on_mount(self):
         self.border_title = "Query"
         self.add_class("section")
-

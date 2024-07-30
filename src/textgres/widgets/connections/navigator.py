@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from rich.text import TextType
+from rich.text import Text, TextType
 from textual import on, log
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -19,15 +19,11 @@ from textgres.widgets.connections.connection_modal import (
 
 class ConnectionTree(TextgresTree[Connection]):
     BINDINGS = [
-        Binding("ctrl+n", "new_connection", "New Connection"),
-        Binding("ctrl+e", "edit_connection", "Edit Connection"),
-        Binding("backspace", "delete_connection", "Delete Connection"),
+        Binding("ctrl+n", "new_connection", "New"),
+        Binding("ctrl+e", "edit_connection", "Edit"),
+        Binding("backspace", "delete_connection", "Delete"),
         Binding("ctrl+d", "disconnect", "Disconnect")
     ]
-
-    COMPONENT_CLASSES = {
-        "node-selected",
-    }
 
     def __init__(
         self,
@@ -59,18 +55,23 @@ class ConnectionTree(TextgresTree[Connection]):
             return self.tree
 
     connections: Reactive[list[Connection]] = reactive([])
+    highlighted_node: Reactive[Optional[TreeNode[Connection]]] = reactive(None)
 
     def watch_connections(self, connections: list[Connection]) -> None:
         self.clear()
-        for connection in connections:
-            self.add_connection(connection)
+        for i, connection in enumerate(connections):
+            node = self.add_connection(connection)
+            if i == 0:
+                self.move_cursor(node)
 
     @on(Tree.NodeExpanded)
     def on_node_expanded(self, event: Tree.NodeExpanded[Connection]) -> None:
         if isinstance(event.node.data, Connection):
             connection = event.node.data
+            self.connect_connection(connection)
+            self.update_node_label(event.node)
             if not connection.connected:
-                connection.connect()
+                event.node.collapse()
 
     @on(Tree.NodeHighlighted)
     def on_node_highlighted(self, event: Tree.NodeHighlighted[Connection]) -> None:
@@ -85,21 +86,6 @@ class ConnectionTree(TextgresTree[Connection]):
             )
         else:
             self.highlighted_node = None
-
-    @on(Tree.NodeSelected)
-    def on_node_selected(self, event: Tree.NodeSelected[Connection]) -> None:
-        connection = event.node.data
-
-        if not isinstance(event.node.data, Connection) or connection.connected:
-            return
-
-        connection.connect()
-        self.notify(
-            title="Connected",
-            message=f"Connected to \"{connection.name}\".",
-            timeout=5,
-        )
-        # self.refresh()
 
     async def action_new_connection(self) -> None:
         focused_before = self.screen.focused
@@ -121,7 +107,6 @@ class ConnectionTree(TextgresTree[Connection]):
 
             def post_new_connection() -> None:
                 self.screen.set_focus(focused_before)
-                self.select_node(new_node)
                 self.scroll_to_node(new_node, animate=False)
 
             self.call_after_refresh(post_new_connection)
@@ -188,6 +173,7 @@ class ConnectionTree(TextgresTree[Connection]):
         if connection.connected:
             connection.disconnect()
             self.highlighted_node.collapse()
+            self.update_node_label(self.highlighted_node)
             self.notify(
                 title="Disconnected",
                 message=f"Disconnected from \"{connection.name}\".",
@@ -195,7 +181,33 @@ class ConnectionTree(TextgresTree[Connection]):
             )
 
     def add_connection(self, connection: Connection) -> TreeNode[Connection]:
-        return self.root.add(connection.name, data=connection)
+        return self.root.add(self.get_connection_label(connection), data=connection)
+
+    def connect_connection(self, connection: Connection) -> None:
+        try:
+          connection.connect()
+          self.notify(
+              title="Connected",
+              message=f"Connected to \"{connection.name}\".",
+              timeout=5,
+          )
+        except Exception as e:
+          self.notify(
+              title="Connection error",
+              message=f"Could not connect to \"{connection.name}\".",
+              severity="error",
+              timeout=5,
+          )
+          log.error(e)
+
+    def get_connection_label(self, connection: Connection) -> Text:
+        label = Text(connection.name)
+        if connection.connected:
+            label.append(" (connected)", style="green")
+        return label
+
+    def update_node_label(self, node: TreeNode[Connection]) -> None:
+        node.set_label(self.get_connection_label(node.data))
 
 class ConnectionPreview(VerticalScroll):
     DEFAULT_CSS = """
@@ -224,7 +236,13 @@ class ConnectionPreview(VerticalScroll):
         self.set_class(connection is None, "hidden")
         if connection:
             host = self.query_one("#host", Static)
-            host.update("{}:{}".format(connection.host, str(connection.port)))
+            host.update(
+                "{}:{}/{}".format(
+                    connection.host,
+                    str(connection.port),
+                    connection.database,
+                )
+            )
 
 class Navigator(Vertical):
     DEFAULT_CSS = """
@@ -232,7 +250,7 @@ class Navigator(Vertical):
         height: 1fr;
         dock: left;
         width: auto;
-        max-width: 33%;
+        max-width: 25%;
 
         & .hidden {
             display: none;
@@ -257,6 +275,7 @@ class Navigator(Vertical):
 
         tree = ConnectionTree(label="connection")
         tree.data_bind(Navigator.connections)
+        tree.auto_expand = False
         tree.guide_depth = 1
         tree.show_root = False
         tree.show_guides = False

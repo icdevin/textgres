@@ -13,7 +13,7 @@ from textgres.widgets.connections.navigator import (
     ConnectionTree,
     Navigator
 )
-from textgres.widgets.query.query_area import QueryArea
+from textgres.widgets.query.query_area import QueryArea, QueryTextArea
 from textgres.widgets.results.results_area import ResultsArea
 
 class AppHeader(Horizontal):
@@ -48,7 +48,7 @@ class MainScreen(Screen[None]):
     AUTO_FOCUS = None
 
     BINDINGS = [
-        Binding("ctrl+h", "toggle_navigator", "Show/Hide Navigator")
+        Binding("ctrl+j", "toggle_navigator", "Show/Hide Navigator")
     ]
 
     connections: Reactive[list[Connection]] = reactive([])
@@ -63,6 +63,8 @@ class MainScreen(Screen[None]):
 
     def action_toggle_navigator(self) -> None:
         self.navigator.toggle_class("hidden")
+        if self.navigator.has_class("hidden") and self.navigator.connection_tree.has_focus:
+            self.focus_next()
 
     @property
     def navigator(self) -> Navigator:
