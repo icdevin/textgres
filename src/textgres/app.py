@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from textual import log
+from textual import log, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -44,41 +44,74 @@ class AppBody(Vertical):
     }
     """
 
-class MainScreen(Screen[None]):
-    AUTO_FOCUS = None
-
+class Textgres(App[None]):
+    CSS_PATH = Path(__file__).parent / "textgres.scss"
     BINDINGS = [
-        Binding("ctrl+j", "toggle_navigator", "Show/Hide Navigator")
+        Binding("ctrl+j", "toggle_navigator", "Show/Hide Navigator"),
     ]
 
-    connections: Reactive[list[Connection]] = reactive([])
+    connections: Reactive[list[Connection]] = reactive(Connection.load())
 
     def compose(self) -> ComposeResult:
         yield AppHeader()
         with AppBody():
-            yield Navigator().data_bind(MainScreen.connections)
-            yield QueryArea()
+            yield Navigator().data_bind(Textgres.connections)
+            yield QueryArea().data_bind(Textgres.connections)
             yield ResultsArea()
         yield Footer()
 
     def action_toggle_navigator(self) -> None:
         self.navigator.toggle_class("hidden")
         if self.navigator.has_class("hidden") and self.navigator.connection_tree.has_focus:
-            self.focus_next()
+            self.screen.focus_next()
+
+    @on(ConnectionTree.ConnectionAdded)
+    def on_connection_added(self, event: ConnectionTree.ConnectionAdded) -> None:
+        connection = event.connection
+
+        connection.save()
+        connections = [*self.connections, connection]
+        self.connections = connections
+
+        self.notify(
+            title="Connection saved",
+            message=f"Connection \"{connection.name}\" saved.",
+            timeout=5,
+        )
+
+    @on(ConnectionTree.ConnectionUpdated)
+    def on_connection_updated(self, event: ConnectionTree.ConnectionUpdated) -> None:
+        connection = event.connection
+
+        connection.save()
+        connections = [c if c != connection else connection for c in self.connections]
+        log(self.connections)
+        self.connections = connections
+        log(self.connections)
+
+        self.notify(
+            title="Connection updated",
+            message=f"Connection \"{connection.name}\" updated.",
+            timeout=5,
+        )
+
+    @on(ConnectionTree.ConnectionRemoved)
+    def on_connection_removed(self, event: ConnectionTree.ConnectionRemoved) -> None:
+        connection = event.connection
+
+        connection.delete()
+        connections = [c for c in self.connections if c != connection]
+        self.connections = connections
+
+        self.notify(
+            title="Connection deleted",
+            message=f"Connection \"{connection.name}\" deleted.",
+            timeout=5,
+        )
 
     @property
     def navigator(self) -> Navigator:
         return self.query_one(Navigator)
-
-class Textgres(App[None]):
-    CSS_PATH = Path(__file__).parent / "textgres.scss"
-    BINDINGS = []
-
-    connections: Reactive[list[Connection]] = reactive(Connection.load())
-
-    def get_default_screen(self) -> MainScreen:
-        self.main_screen = MainScreen().data_bind(Textgres.connections)
-        return self.main_screen
 
 if __name__ == "__main__":
     app = Textgres()
