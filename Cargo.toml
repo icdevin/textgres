@@ -1,0 +1,27 @@
+[package]
+name = "textgres"
+version = "0.1.0"
+edition = "2024"
+description = "A PostgreSQL exploration TUI"
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = "1.0"
+directories = "6.0"
+futures-util = "0.3"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7.18"
+toml = "0.9"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3.0"
+
+[profile.release]
+lto = "thin"
+strip = true
