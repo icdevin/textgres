@@ -7,7 +7,7 @@ The initial application supports:
 - Saved connection profiles and passwords.
 - An expandable `connection → database → schema → table` explorer.
 - Read-only table previews.
-- Multi-line SQL editing and execution.
+- Multi-line SQL editing with live syntax highlighting and execution.
 - Saved SQL scripts.
 - Bounded result rendering with vertical and horizontal navigation.
 

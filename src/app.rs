@@ -4,17 +4,13 @@ use std::{
   time::{SystemTime, UNIX_EPOCH},
 };
 
-use ratatui::{
-  crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-  style::Style,
-};
-use ratatui_textarea::TextArea;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::runtime::Handle;
 
 use crate::{
   db::{self, Output, QueryResult, Request, Response, TableRef},
+  sql_editor::SqlEditor,
   storage::{ConnectionProfile, Storage},
-  theme::THEME,
 };
 
 const MIN_EXPLORER_WIDTH_PERCENT: u16 = 15;
@@ -196,7 +192,7 @@ pub struct App {
   pub explorer_selected: usize,
   pub explorer_width_percent: u16,
   pub sql_height_percent: u16,
-  pub sql: TextArea<'static>,
+  pub sql: SqlEditor,
   pub result: QueryResult,
   pub result_row: usize,
   pub result_column: usize,
@@ -885,16 +881,13 @@ impl App {
 }
 
 // Keeps the SQL editor configuration consistent after loading a script.
-fn sql_editor(sql: &str) -> TextArea<'static> {
+fn sql_editor(sql: &str) -> SqlEditor {
   let lines = if sql.is_empty() {
     vec![String::new()]
   } else {
     sql.split('\n').map(str::to_owned).collect()
   };
-  let mut editor = TextArea::new(lines);
-  editor.set_line_number_style(Style::default().fg(THEME.muted));
-  editor.set_cursor_line_style(Style::default().bg(THEME.cursor_line));
-  editor
+  SqlEditor::new(lines)
 }
 
 // Edits at Unicode scalar boundaries so non-ASCII input cannot corrupt a field.

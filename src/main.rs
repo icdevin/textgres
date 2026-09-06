@@ -1,5 +1,6 @@
 mod app;
 mod db;
+mod sql_editor;
 mod storage;
 mod theme;
 mod ui;
