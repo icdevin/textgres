@@ -6,7 +6,7 @@ use std::{
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    style::{Color, Style},
+    style::Style,
 };
 use ratatui_textarea::TextArea;
 use tokio::runtime::Handle;
@@ -14,6 +14,7 @@ use tokio::runtime::Handle;
 use crate::{
     db::{self, Output, QueryResult, Request, Response, TableRef},
     storage::{ConnectionProfile, Storage},
+    theme::THEME,
 };
 
 const MIN_EXPLORER_WIDTH_PERCENT: u16 = 15;
@@ -896,8 +897,8 @@ fn sql_editor(sql: &str) -> TextArea<'static> {
         sql.split('\n').map(str::to_owned).collect()
     };
     let mut editor = TextArea::new(lines);
-    editor.set_line_number_style(Style::default().fg(Color::DarkGray));
-    editor.set_cursor_line_style(Style::default().bg(Color::Rgb(30, 34, 42)));
+    editor.set_line_number_style(Style::default().fg(THEME.muted));
+    editor.set_cursor_line_style(Style::default().bg(THEME.cursor_line));
     editor
 }
 

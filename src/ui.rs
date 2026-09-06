@@ -10,10 +10,11 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, ConnectionField, ExplorerNode, Focus, NodeKey, Overlay};
+use crate::{
+    app::{App, ConnectionField, ExplorerNode, ExplorerRow, Focus, NodeKey, Overlay},
+    theme::THEME,
+};
 
-const ACCENT: Color = Color::Rgb(92, 173, 255);
-const MUTED: Color = Color::Rgb(130, 140, 150);
 const MIN_COLUMN_WIDTH: usize = 8;
 const MAX_COLUMN_WIDTH: usize = 48;
 
@@ -51,7 +52,7 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             None => "  ",
         };
         let indentation = "  ".repeat(row.depth);
-        ListItem::new(format!("{indentation}{prefix}{}", row.label))
+        explorer_item(row, &indentation, prefix)
     });
     // An empty connection list has no valid selected row.
     let mut state =
@@ -60,12 +61,52 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .block(pane_block(" Explorer ", app.focus == Focus::Explorer))
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(42, 52, 64))
+                .bg(THEME.selection)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+// Color hierarchy levels by meaning so dense explorer trees remain scannable.
+fn explorer_item(row: &ExplorerRow, indentation: &str, prefix: &str) -> ListItem<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{indentation}{prefix}"),
+        Style::default().fg(THEME.muted),
+    )];
+    match &row.node {
+        ExplorerNode::Connection(_) => spans.push(Span::styled(
+            row.label.clone(),
+            Style::default().fg(THEME.cyan).add_modifier(Modifier::BOLD),
+        )),
+        ExplorerNode::Database { .. } => spans.push(Span::styled(
+            row.label.clone(),
+            Style::default().fg(THEME.accent),
+        )),
+        ExplorerNode::Schema { .. } => spans.push(Span::styled(
+            row.label.clone(),
+            Style::default().fg(THEME.purple),
+        )),
+        ExplorerNode::Table(table) => {
+            let color = if table.kind.contains("view") {
+                Some(THEME.green)
+            } else if table.kind == "foreign table" {
+                Some(THEME.yellow)
+            } else {
+                None
+            };
+            spans.push(Span::styled(
+                table.name.clone(),
+                color.map_or_else(Style::default, |color| Style::default().fg(color)),
+            ));
+            spans.push(Span::styled(
+                format!("  [{}]", table.kind),
+                Style::default().fg(THEME.muted).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn draw_sql(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -96,7 +137,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         frame.render_widget(
             Paragraph::new(text)
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(THEME.muted))
                 .block(block)
                 .wrap(Wrap { trim: false }),
             area,
@@ -119,15 +160,16 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .iter()
             .map(|(index, _)| Cell::from(app.result.columns[*index].as_str())),
     )
-    .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(THEME.accent)
+            .add_modifier(Modifier::BOLD),
+    )
     .bottom_margin(1);
     let rows = app.result.rows.iter().map(|values| {
         Row::new(visible.iter().map(|(index, _)| {
-            Cell::from(
-                values
-                    .get(*index)
-                    .map_or_else(String::new, |value| one_line(value)),
-            )
+            let value = values.get(*index).and_then(Option::as_deref);
+            result_cell(value)
         }))
     });
     let mut state = TableState::default();
@@ -140,22 +182,36 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .header(header)
         .block(block)
         .column_spacing(1)
-        .row_highlight_style(Style::default().bg(Color::Rgb(42, 52, 64)))
+        .row_highlight_style(Style::default().bg(THEME.selection))
         .highlight_symbol("› ");
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+// NULL has distinct semantics and should not look like the literal text "NULL".
+fn result_cell(value: Option<&str>) -> Cell<'static> {
+    match value {
+        Some(value) => Cell::from(one_line(value)),
+        None => Cell::from(Line::styled(
+            "NULL",
+            Style::default()
+                .fg(THEME.yellow)
+                .add_modifier(Modifier::ITALIC),
+        )),
+    }
+}
+
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let color = if app.status_is_error {
-        Color::LightRed
+        THEME.red
     } else if app.busy.is_some() {
-        Color::LightYellow
+        THEME.yellow
     } else {
-        MUTED
+        THEME.green
     };
     let prefix = if app.busy.is_some() { "● " } else { "" };
     let shortcuts = shortcuts(app);
-    let shortcut_width = shortcuts.width().min(usize::from(area.width)) as u16;
+    let shortcut_line = shortcut_line(&shortcuts);
+    let shortcut_width = shortcut_line.width().min(usize::from(area.width)) as u16;
     let sections =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(shortcut_width)]).split(area);
     frame.render_widget(
@@ -163,37 +219,82 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         sections[0],
     );
     frame.render_widget(
-        Paragraph::new(shortcuts)
-            .alignment(Alignment::Right)
-            .style(Style::default().fg(MUTED)),
+        Paragraph::new(shortcut_line).alignment(Alignment::Right),
         sections[1],
     );
 }
 
 // Show only actions that apply to the active pane or modal dialog.
-fn shortcuts(app: &App) -> String {
+fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(overlay) = &app.overlay {
         return match overlay {
             Overlay::Connection(form) if form.selected_field() == ConnectionField::RequireTls => {
-                "Space toggle  Tab field  ^S save  Esc cancel".into()
+                vec![
+                    ("Space", "toggle"),
+                    ("Tab", "field"),
+                    ("^S", "save"),
+                    ("Esc", "cancel"),
+                ]
             }
-            Overlay::Connection(_) => "Tab field  ^S save  Esc cancel".into(),
-            Overlay::SaveScript { .. } => "Enter save  Esc cancel".into(),
-            Overlay::LoadScript { .. } => "↑↓ select  Enter load  Esc cancel".into(),
-            Overlay::ConfirmDelete { .. } => "Y/Enter delete  N/Esc cancel".into(),
+            Overlay::Connection(_) => {
+                vec![("Tab", "field"), ("^S", "save"), ("Esc", "cancel")]
+            }
+            Overlay::SaveScript { .. } => vec![("Enter", "save"), ("Esc", "cancel")],
+            Overlay::LoadScript { .. } => {
+                vec![("↑↓", "select"), ("Enter", "load"), ("Esc", "cancel")]
+            }
+            Overlay::ConfirmDelete { .. } => {
+                vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
+            }
         };
     }
 
     match app.focus {
-        Focus::Explorer => {
-            "↑↓ move  Enter/→ open  ← close  n new  e edit  d delete  ^←/^→ width  Tab pane  ^Q quit"
-                .into()
-        }
-        Focus::Sql => {
-            "F5/^Enter run  ^S save  ^L load  ^↑/^↓ height  Tab pane  ^Q quit".into()
-        }
-        Focus::Results => "↑↓ rows  ←→ columns  Tab pane  ^Q quit".into(),
+        Focus::Explorer => vec![
+            ("↑↓", "move"),
+            ("Enter/→", "open"),
+            ("←", "close"),
+            ("n", "new"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("^←/^→", "width"),
+            ("Tab", "pane"),
+            ("^Q", "quit"),
+        ],
+        Focus::Sql => vec![
+            ("F5/^Enter", "run"),
+            ("^S", "save"),
+            ("^L", "load"),
+            ("^↑/^↓", "height"),
+            ("Tab", "pane"),
+            ("^Q", "quit"),
+        ],
+        Focus::Results => vec![
+            ("↑↓", "rows"),
+            ("←→", "columns"),
+            ("Tab", "pane"),
+            ("^Q", "quit"),
+        ],
     }
+}
+
+// Accent key chords while leaving their action labels quiet.
+fn shortcut_line(shortcuts: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, action)) in shortcuts.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*action, Style::default().fg(THEME.muted)));
+    }
+    Line::from(spans)
 }
 
 fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
@@ -208,7 +309,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
             };
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(THEME.accent))
                 .title(title);
             let inner = block.inner(area);
             frame.render_widget(block, area);
@@ -228,14 +329,14 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
                     _ => form.value(field).unwrap_or_default().to_owned(),
                 };
                 let style = if selected {
-                    Style::default().fg(Color::White).bg(Color::Rgb(42, 52, 64))
+                    Style::default().fg(Color::White).bg(THEME.selection)
                 } else {
-                    Style::default().fg(MUTED)
+                    Style::default().fg(THEME.muted)
                 };
                 let label = format!("{:<24}", format!("{}:", field.label()));
                 frame.render_widget(
                     Paragraph::new(Line::from(vec![
-                        Span::styled(label, Style::default().fg(MUTED)),
+                        Span::styled(label, Style::default().fg(THEME.muted)),
                         Span::styled(value, style),
                     ])),
                     fields[index],
@@ -256,7 +357,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
             frame.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT))
+                .border_style(Style::default().fg(THEME.accent))
                 .title(" Save script ");
             let inner = block.inner(area);
             frame.render_widget(block, area);
@@ -276,18 +377,21 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
             let height = (scripts.len() as u16).saturating_add(2).clamp(5, 20);
             let area = centered(frame.area(), 58, height);
             frame.render_widget(Clear, area);
-            let items = scripts
-                .iter()
-                .map(|name| ListItem::new(format!("{name}.sql")));
+            let items = scripts.iter().map(|name| {
+                ListItem::new(Line::styled(
+                    format!("{name}.sql"),
+                    Style::default().fg(THEME.cyan),
+                ))
+            });
             let mut state = ListState::default().with_selected(Some(*selected));
             let list = List::new(items)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(ACCENT))
+                        .border_style(Style::default().fg(THEME.accent))
                         .title(" Load script "),
                 )
-                .highlight_style(Style::default().bg(Color::Rgb(42, 52, 64)).fg(Color::White))
+                .highlight_style(Style::default().bg(THEME.selection).fg(Color::White))
                 .highlight_symbol("› ");
             frame.render_stateful_widget(list, area, &mut state);
         }
@@ -300,7 +404,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::LightRed))
+                            .border_style(Style::default().fg(THEME.red))
                             .title(" Confirm delete "),
                     ),
                 area,
@@ -312,7 +416,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
 fn pane_block(title: &str, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
+        .border_style(Style::default().fg(if focused { THEME.accent } else { THEME.muted }))
         .title(title.to_owned())
 }
 
@@ -397,7 +501,11 @@ fn column_width(result: &crate::db::QueryResult, index: usize) -> usize {
         .rows
         .iter()
         .filter_map(|row| row.get(index))
-        .map(|value| one_line(value).width())
+        .map(|value| {
+            value
+                .as_deref()
+                .map_or("NULL".width(), |value| one_line(value).width())
+        })
         .max()
         .unwrap_or(0);
     header_width
@@ -464,8 +572,9 @@ mod tests {
                 kind: "table".into(),
             }],
         );
-        app.result.columns = vec!["id".into(), "email".into()];
-        app.result.rows = vec![vec!["1".into(), "dev@example.com".into()]];
+        app.explorer_selected = 1;
+        app.result.columns = vec!["id".into(), "email".into(), "note".into()];
+        app.result.rows = vec![vec![Some("1".into()), Some("dev@example.com".into()), None]];
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -482,7 +591,22 @@ mod tests {
         assert!(!screen.contains("Saved scripts"));
         assert!(!screen.contains("inspect_users.sql"));
         assert!(screen.contains("dev@example.com"));
+        assert!(screen.contains("NULL"));
         assert!(screen.contains("^←/^→ width"));
+        let cells = terminal.backend().buffer().content();
+        assert!(cells.iter().any(|cell| {
+            cell.symbol() == "L" && cell.fg == THEME.cyan && cell.modifier.contains(Modifier::BOLD)
+        }));
+        assert!(cells.iter().any(|cell| {
+            cell.symbol() == "N"
+                && cell.fg == THEME.yellow
+                && cell.modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(cells.iter().any(|cell| {
+            cell.symbol() == "^"
+                && cell.fg == THEME.accent
+                && cell.modifier.contains(Modifier::BOLD)
+        }));
 
         // Explorer resize keys adjust the Ratatui layout without collapsing nodes.
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
@@ -532,7 +656,11 @@ mod tests {
     fn measures_result_columns_with_sane_bounds() {
         let result = crate::db::QueryResult {
             columns: vec!["id".into(), "description".into(), "payload".into()],
-            rows: vec![vec!["1".into(), "medium value".into(), "x".repeat(100)]],
+            rows: vec![vec![
+                Some("1".into()),
+                Some("medium value".into()),
+                Some("x".repeat(100)),
+            ]],
             ..Default::default()
         };
 

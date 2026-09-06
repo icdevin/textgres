@@ -24,7 +24,7 @@ pub struct TableRef {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<Option<String>>>,
     pub status: String,
     pub truncated: bool,
 }
@@ -258,7 +258,8 @@ async fn run_query(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result
                 }
                 result.rows.push(
                     (0..row.len())
-                        .map(|index| row.get(index).unwrap_or("NULL").to_owned())
+                        // Preserve nullability so the renderer never confuses NULL with text.
+                        .map(|index| row.get(index).map(str::to_owned))
                         .collect(),
                 );
             }

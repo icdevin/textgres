@@ -1,6 +1,7 @@
 mod app;
 mod db;
 mod storage;
+mod theme;
 mod ui;
 
 use std::{io, sync::mpsc, time::Duration};
