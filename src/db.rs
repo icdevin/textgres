@@ -4,7 +4,11 @@ use futures_util::StreamExt;
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use tokio::runtime::Handle;
-use tokio_postgres::{Config, SimpleQueryMessage, config::SslMode};
+use tokio_postgres::{
+    Config, SimpleQueryMessage,
+    config::SslMode,
+    error::{DbError, ErrorPosition},
+};
 
 use crate::storage::ConnectionProfile;
 
@@ -85,6 +89,50 @@ pub enum Output {
 #[derive(Debug)]
 pub struct Response {
     pub result: anyhow::Result<Output>,
+}
+
+/// Preserves structured PostgreSQL diagnostics and falls back for transport errors.
+pub fn format_error(error: &anyhow::Error) -> String {
+    let database_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tokio_postgres::Error>())
+        .and_then(tokio_postgres::Error::as_db_error);
+    let Some(database_error) = database_error else {
+        return format!("Database error: {error:#}");
+    };
+    format_database_error(database_error)
+}
+
+fn format_database_error(error: &DbError) -> String {
+    let mut lines = vec![sql_error_header(
+        error.code().code(),
+        error.severity(),
+        error.message(),
+    )];
+    if let Some(detail) = error.detail() {
+        lines.push(format!("Detail: {detail}"));
+    }
+    if let Some(hint) = error.hint() {
+        lines.push(format!("Hint: {hint}"));
+    }
+    if let Some(position) = error.position() {
+        lines.extend(format_error_position(position));
+    }
+    lines.join("\n")
+}
+
+fn sql_error_header(code: &str, severity: &str, message: &str) -> String {
+    format!("SQL Error [{code}]: {severity}: {message}")
+}
+
+fn format_error_position(position: &ErrorPosition) -> Vec<String> {
+    match position {
+        ErrorPosition::Original(position) => vec![format!("Position: {position}")],
+        ErrorPosition::Internal { position, query } => vec![
+            format!("Internal position: {position}"),
+            format!("Internal query: {query}"),
+        ],
+    }
 }
 
 /// Runs database I/O outside the terminal event loop.
@@ -295,5 +343,20 @@ mod tests {
     #[test]
     fn quotes_postgres_identifiers() {
         assert_eq!(quote_identifier("odd\"name"), "\"odd\"\"name\"");
+    }
+
+    #[test]
+    fn formats_postgres_error_identity_and_position() {
+        let mut lines = vec![sql_error_header(
+            "42P01",
+            "ERROR",
+            "relation \"derp\" does not exist",
+        )];
+        lines.extend(format_error_position(&ErrorPosition::Original(52)));
+
+        assert_eq!(
+            lines.join("\n"),
+            "SQL Error [42P01]: ERROR: relation \"derp\" does not exist\nPosition: 52"
+        );
     }
 }

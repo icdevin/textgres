@@ -386,7 +386,7 @@ impl App {
                 self.focus = Focus::Results;
                 self.set_status(status, false);
             }
-            Err(error) => self.set_status(format!("Database error: {error:#}"), true),
+            Err(error) => self.set_status(db::format_error(&error), true),
         }
     }
 

@@ -4,8 +4,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-        Wrap,
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+        TableState, Wrap,
     },
 };
 use unicode_width::UnicodeWidthStr;
@@ -20,7 +20,12 @@ const MAX_COLUMN_WIDTH: usize = 48;
 
 /// Draws the whole workspace from application state on each frame.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let page = Layout::vertical([Constraint::Min(8), Constraint::Length(1)]).split(frame.area());
+    // Separate messages from controls so neither competes for horizontal space.
+    let status_height = status_height(app, frame.area().width);
+    let page = Layout::vertical([Constraint::Min(8), Constraint::Length(status_height + 1)])
+        .split(frame.area());
+    let footer =
+        Layout::vertical([Constraint::Length(status_height), Constraint::Length(1)]).split(page[1]);
     // Give query editing and results more room than the compact connection tree.
     let work = Layout::horizontal([
         Constraint::Percentage(app.explorer_width_percent),
@@ -36,7 +41,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_explorer(frame, app, work[0]);
     draw_sql(frame, app, right[0]);
     draw_results(frame, app, right[1]);
-    draw_status(frame, app, page[1]);
+    draw_status(frame, app, footer[0]);
+    draw_shortcuts(frame, app, footer[1]);
 
     if let Some(overlay) = &app.overlay {
         draw_overlay(frame, overlay, &app.scripts);
@@ -209,18 +215,35 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         THEME.green
     };
     let prefix = if app.busy.is_some() { "● " } else { "" };
-    let shortcuts = shortcuts(app);
-    let shortcut_line = shortcut_line(&shortcuts);
-    let shortcut_width = shortcut_line.width().min(usize::from(area.width)) as u16;
-    let sections =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(shortcut_width)]).split(area);
     frame.render_widget(
-        Paragraph::new(format!("{prefix}{}", app.status)).style(Style::default().fg(color)),
-        sections[0],
+        Paragraph::new(format!("{prefix}{}", app.status))
+            .style(Style::default().fg(color))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(Padding::horizontal(1))),
+        area,
     );
+}
+
+// Grow error diagnostics while bounding their effect on the main workspace.
+fn status_height(app: &App, area_width: u16) -> u16 {
+    if !app.status_is_error {
+        return 1;
+    }
+    let line_width = usize::from(area_width.saturating_sub(2).max(1));
+    app.status
+        .lines()
+        .map(|line| line.width().max(1).div_ceil(line_width))
+        .sum::<usize>()
+        .clamp(1, 4) as u16
+}
+
+fn draw_shortcuts(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let shortcuts = shortcuts(app);
     frame.render_widget(
-        Paragraph::new(shortcut_line).alignment(Alignment::Right),
-        sections[1],
+        Paragraph::new(shortcut_line(&shortcuts))
+            .alignment(Alignment::Right)
+            .block(Block::default().padding(Padding::horizontal(1))),
+        area,
     );
 }
 
@@ -650,6 +673,24 @@ mod tests {
         assert!(form.contains("localhost"));
         assert!(form.contains("Password (saved):"));
         assert!(!form.contains("secret"));
+
+        // Errors and shortcuts occupy independent full-width footer rows.
+        app.overlay = None;
+        app.status =
+            "SQL Error [42P01]: ERROR: relation \"derp\" does not exist\nPosition: 52".into();
+        app.status_is_error = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let error = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(error.contains("SQL Error [42P01]: ERROR: relation \"derp\" does not exist"));
+        assert!(error.contains("Position: 52"));
+        assert!(error.contains("^Q"));
+        assert_eq!(status_height(&app, 120), 2);
     }
 
     #[test]
