@@ -268,6 +268,19 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       Overlay::LoadScript { .. } => {
         vec![("↑↓", "select"), ("Enter", "load"), ("Esc", "cancel")]
       }
+      Overlay::RowDetail(form) if form.editing => {
+        vec![("Esc", "done"), ("^N", "toggle NULL"), ("^S", "save row")]
+      }
+      Overlay::RowDetail(form) if !form.row_is_editable() => {
+        vec![("↑↓", "field"), ("Esc", "close")]
+      }
+      Overlay::RowDetail(_) => vec![
+        ("↑↓", "field"),
+        ("Enter", "edit"),
+        ("^N", "toggle NULL"),
+        ("^S", "save row"),
+        ("Esc", "close"),
+      ],
       Overlay::ConfirmDelete { .. } => {
         vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
       }
@@ -297,6 +310,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
     Focus::Results => vec![
       ("↑↓", "rows"),
       ("←→", "columns"),
+      ("Enter", "inspect"),
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
@@ -420,6 +434,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
         .highlight_symbol("› ");
       frame.render_stateful_widget(list, area, &mut state);
     }
+    Overlay::RowDetail(form) => draw_row_detail(frame, form),
     Overlay::ConfirmDelete { name, .. } => {
       let area = centered(frame.area(), 50, 5);
       frame.render_widget(Clear, area);
@@ -435,6 +450,90 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
         area,
       );
     }
+  }
+}
+
+fn draw_row_detail(frame: &mut Frame<'_>, form: &crate::app::RowDetail) {
+  let area = centered(
+    frame.area(),
+    92,
+    frame.area().height.saturating_sub(4).max(8),
+  );
+  frame.render_widget(Clear, area);
+  let source = form.source.as_ref();
+  let mode = if form.row_is_editable() {
+    "editable"
+  } else {
+    "read-only"
+  };
+  let source_name = source.map_or_else(
+    || "custom result".to_owned(),
+    |source| format!("{}.{}", source.table.schema, source.table.name),
+  );
+  let block = Block::default()
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(THEME.accent))
+    .title(format!(
+      " Row {} · {source_name} · {mode} ",
+      form.row_index + 1
+    ));
+  let inner = block.inner(area);
+  frame.render_widget(block, area);
+  let panes =
+    Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(inner);
+
+  let items = form.columns.iter().enumerate().map(|(index, name)| {
+    let metadata = source.and_then(|source| source.columns.get(index));
+    let marker = if metadata.is_some_and(|column| column.primary_key) {
+      "◆ "
+    } else if metadata.is_some_and(|column| !column.editable) {
+      "· "
+    } else {
+      "  "
+    };
+    let value = form.values.get(index).and_then(Option::as_deref);
+    let value = value.map_or_else(|| "NULL".to_owned(), one_line);
+    ListItem::new(Line::from(vec![
+      Span::styled(
+        format!("{marker}{name}"),
+        Style::default()
+          .fg(if metadata.is_some_and(|column| column.primary_key) {
+            THEME.accent
+          } else {
+            THEME.cyan
+          })
+          .add_modifier(Modifier::BOLD),
+      ),
+      Span::styled(format!("  {value}"), Style::default().fg(THEME.muted)),
+    ]))
+  });
+  let mut state = ListState::default().with_selected(Some(form.selected));
+  let list = List::new(items)
+    .block(Block::default().borders(Borders::RIGHT).title(" Columns "))
+    .highlight_style(Style::default().bg(THEME.selection).fg(Color::White))
+    .highlight_symbol("› ");
+  frame.render_stateful_widget(list, panes[0], &mut state);
+
+  let column = form
+    .columns
+    .get(form.selected)
+    .map_or("Value", String::as_str);
+  let value_block = Block::default().title(format!(" {column} "));
+  let value_area = value_block.inner(panes[1]);
+  frame.render_widget(value_block, panes[1]);
+  if form.editing {
+    frame.render_widget(&form.editor, value_area);
+  } else if let Some(value) = form.selected_value() {
+    frame.render_widget(Paragraph::new(value).wrap(Wrap { trim: false }), value_area);
+  } else {
+    frame.render_widget(
+      Paragraph::new("NULL").style(
+        Style::default()
+          .fg(THEME.yellow)
+          .add_modifier(Modifier::ITALIC),
+      ),
+      value_area,
+    );
   }
 }
 
@@ -547,7 +646,10 @@ mod tests {
   use ratatui::{Terminal, backend::TestBackend};
 
   use super::*;
-  use crate::{db::TableRef, storage::ConnectionProfile};
+  use crate::{
+    db::{ResultColumn, TableRef, TableResultSource},
+    storage::ConnectionProfile,
+  };
 
   #[test]
   fn renders_the_complete_exploration_workspace() {
@@ -603,6 +705,36 @@ mod tests {
     app.explorer_selected = 1;
     app.result.columns = vec!["id".into(), "email".into(), "note".into()];
     app.result.rows = vec![vec![Some("1".into()), Some("dev@example.com".into()), None]];
+    // Source metadata makes the table-preview row safe to edit.
+    app.result.source = Some(TableResultSource {
+      table: TableRef {
+        profile_id: "local".into(),
+        database: "postgres".into(),
+        schema: "public".into(),
+        name: "users".into(),
+        kind: "table".into(),
+      },
+      columns: vec![
+        ResultColumn {
+          name: "id".into(),
+          type_name: "integer".into(),
+          editable: true,
+          primary_key: true,
+        },
+        ResultColumn {
+          name: "email".into(),
+          type_name: "text".into(),
+          editable: true,
+          primary_key: false,
+        },
+        ResultColumn {
+          name: "note".into(),
+          type_name: "text".into(),
+          editable: true,
+          primary_key: false,
+        },
+      ],
+    });
 
     let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -632,7 +764,24 @@ mod tests {
       cell.symbol() == "^" && cell.fg == THEME.accent && cell.modifier.contains(Modifier::BOLD)
     }));
 
+    // Enter opens a full row viewer with source and edit state visible.
+    app.focus = Focus::Results;
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let row_detail = terminal
+      .backend()
+      .buffer()
+      .content()
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(row_detail.contains("Row 1 · public.users · editable"));
+    assert!(row_detail.contains("dev@example.com"));
+    assert!(row_detail.contains("◆ id"));
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
     // Explorer resize keys adjust the Ratatui layout without collapsing nodes.
+    app.focus = Focus::Explorer;
     app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
     assert_eq!(app.explorer_width_percent, 23);
     assert!(app.expanded.contains(&NodeKey::Connection("local".into())));

@@ -4,13 +4,18 @@ use std::{
   time::{SystemTime, UNIX_EPOCH},
 };
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{
+  crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+  style::Style,
+};
+use ratatui_textarea::{CursorMove, TextArea};
 use tokio::runtime::Handle;
 
 use crate::{
   db::{self, Output, QueryResult, Request, Response, TableRef},
   sql_editor::SqlEditor,
   storage::{ConnectionProfile, Storage},
+  theme::THEME,
 };
 
 const MIN_EXPLORER_WIDTH_PERCENT: u16 = 15;
@@ -170,12 +175,96 @@ impl ConnectionForm {
   }
 }
 
+/// Expanded row state keeps edits isolated until the user explicitly saves.
+#[derive(Clone, Debug)]
+pub struct RowDetail {
+  pub row_index: usize,
+  pub columns: Vec<String>,
+  pub source: Option<db::TableResultSource>,
+  pub original: Vec<Option<String>>,
+  pub values: Vec<Option<String>>,
+  pub selected: usize,
+  pub editing: bool,
+  pub editor: TextArea<'static>,
+}
+
+impl RowDetail {
+  fn new(result: &QueryResult, row_index: usize) -> Option<Self> {
+    let values = result.rows.get(row_index)?.clone();
+    Some(Self {
+      row_index,
+      columns: result.columns.clone(),
+      source: result.source.clone(),
+      original: values.clone(),
+      editor: row_value_editor(values.first().and_then(Option::as_deref)),
+      values,
+      selected: 0,
+      editing: false,
+    })
+  }
+
+  pub fn selected_value(&self) -> Option<&str> {
+    self.values.get(self.selected).and_then(Option::as_deref)
+  }
+
+  pub fn selected_is_editable(&self) -> bool {
+    self.row_is_editable()
+      && self.source.as_ref().is_some_and(|source| {
+        source
+          .columns
+          .get(self.selected)
+          .is_some_and(|column| column.editable)
+      })
+  }
+
+  pub fn row_is_editable(&self) -> bool {
+    self.source.as_ref().is_some_and(|source| {
+      source.columns.iter().any(|column| column.primary_key)
+        && source.columns.iter().any(|column| column.editable)
+    })
+  }
+
+  fn move_selection(&mut self, change: isize) {
+    self.selected = (self.selected as isize + change)
+      .clamp(0, self.columns.len().saturating_sub(1) as isize) as usize;
+    self.editor = row_value_editor(self.selected_value());
+  }
+
+  fn begin_edit(&mut self) {
+    if self.selected_is_editable() {
+      // Entering a NULL field starts an intentional empty-string edit.
+      self.values[self.selected].get_or_insert_default();
+      self.editor = row_value_editor(self.selected_value());
+      self.editing = true;
+    }
+  }
+
+  fn finish_edit(&mut self) {
+    if self.editing && self.values[self.selected].is_some() {
+      self.values[self.selected] = Some(self.editor.lines().join("\n"));
+    }
+    self.editing = false;
+  }
+
+  fn toggle_null(&mut self) {
+    if !self.selected_is_editable() {
+      return;
+    }
+    self.values[self.selected] = match self.values[self.selected] {
+      Some(_) => None,
+      None => Some(String::new()),
+    };
+    self.editor = row_value_editor(self.selected_value());
+  }
+}
+
 /// Only one overlay exists at once, which prevents conflicting key handlers.
 #[derive(Clone, Debug)]
 pub enum Overlay {
   Connection(ConnectionForm),
   SaveScript { name: String, cursor: usize },
   LoadScript { selected: usize },
+  RowDetail(Box<RowDetail>),
   ConfirmDelete { profile_id: String, name: String },
 }
 
@@ -201,6 +290,7 @@ pub struct App {
   pub busy: Option<String>,
   pub status: String,
   pub status_is_error: bool,
+  pending_row_edit: Option<RowDetail>,
   storage: Storage,
   runtime: Handle,
   database_tx: Sender<Response>,
@@ -236,6 +326,7 @@ impl App {
       busy: None,
       status: "Ready".into(),
       status_is_error: false,
+      pending_row_edit: None,
       storage,
       runtime,
       database_tx,
@@ -382,7 +473,21 @@ impl App {
         self.focus = Focus::Results;
         self.set_status(status, false);
       }
-      Err(error) => self.set_status(db::format_error(&error), true),
+      Ok(Output::Updated(result)) => {
+        let status = format!("Row updated; {}", result.status);
+        self.pending_row_edit = None;
+        self.result = result;
+        self.result_row = 0;
+        self.result_column = 0;
+        self.focus = Focus::Results;
+        self.set_status(status, false);
+      }
+      Err(error) => {
+        if let Some(form) = self.pending_row_edit.take() {
+          self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+        }
+        self.set_status(db::format_error(&error), true);
+      }
     }
   }
 
@@ -473,6 +578,7 @@ impl App {
       KeyCode::End | KeyCode::Char('G') => {
         self.result_row = self.result.rows.len().saturating_sub(1)
       }
+      KeyCode::Enter => self.open_row_detail(),
       _ => {}
     }
   }
@@ -563,6 +669,53 @@ impl App {
             }
             return;
           }
+          _ => {}
+        }
+        self.overlay = Some(overlay);
+      }
+      Overlay::RowDetail(form) => {
+        if form.editing {
+          if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            form.finish_edit();
+            if let Err(error) = self.save_row(form) {
+              self.set_status(error, true);
+              self.overlay = Some(overlay);
+            }
+            return;
+          } else if key.code == KeyCode::Esc {
+            form.finish_edit();
+          } else if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n')
+          {
+            form.toggle_null();
+          } else {
+            form.editor.input(key);
+          }
+          self.overlay = Some(overlay);
+          return;
+        }
+        if key.code == KeyCode::Esc {
+          return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+          if let Err(error) = self.save_row(form) {
+            self.set_status(error, true);
+            self.overlay = Some(overlay);
+          }
+          return;
+        }
+        match key.code {
+          KeyCode::Up | KeyCode::Char('k') => form.move_selection(-1),
+          KeyCode::Down | KeyCode::Char('j') => form.move_selection(1),
+          KeyCode::Home | KeyCode::Char('g') => form.move_selection(-(form.selected as isize)),
+          KeyCode::End | KeyCode::Char('G') => form.move_selection(form.columns.len() as isize),
+          KeyCode::Enter => {
+            if form.selected_is_editable() {
+              form.begin_edit();
+            } else {
+              self.set_status(row_read_only_reason(form), true);
+            }
+          }
+          KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => form.toggle_null(),
           _ => {}
         }
         self.overlay = Some(overlay);
@@ -725,6 +878,51 @@ impl App {
         sql,
       },
     );
+  }
+
+  fn open_row_detail(&mut self) {
+    if let Some(form) = RowDetail::new(&self.result, self.result_row) {
+      // Keep the large multiline editor outside the compact overlay enum.
+      self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+    } else {
+      self.set_status("Select a result row to inspect it".into(), true);
+    }
+  }
+
+  fn save_row(&mut self, form: &RowDetail) -> Result<(), String> {
+    if self.busy.is_some() {
+      return Err("Wait for the current database operation to finish".into());
+    }
+    let source = form
+      .source
+      .clone()
+      .ok_or_else(|| "Custom SQL results are read-only".to_owned())?;
+    if !source.columns.iter().any(|column| column.primary_key) {
+      return Err("This table has no primary key; the row is read-only".into());
+    }
+    if form.original == form.values {
+      return Err("No row values changed".into());
+    }
+    let profile_id = &source.table.profile_id;
+    let profile = self
+      .profile(profile_id)
+      .cloned()
+      .ok_or_else(|| "The source connection no longer exists".to_owned())?;
+    self.pending_row_edit = Some(form.clone());
+    self.dispatch(
+      format!(
+        "Updating row in {}.{}",
+        source.table.schema, source.table.name
+      ),
+      Request::UpdateRow {
+        password: self.password(profile_id),
+        profile,
+        source,
+        original: form.original.clone(),
+        values: form.values.clone(),
+      },
+    );
+    Ok(())
   }
 
   fn dispatch(&mut self, description: String, request: Request) {
@@ -890,6 +1088,29 @@ fn sql_editor(sql: &str) -> SqlEditor {
   SqlEditor::new(lines)
 }
 
+// Row values use a plain multiline editor because their contents are not SQL.
+fn row_value_editor(value: Option<&str>) -> TextArea<'static> {
+  let lines = value.map_or_else(
+    || vec![String::new()],
+    |value| value.split('\n').map(str::to_owned).collect(),
+  );
+  let mut editor = TextArea::new(lines);
+  editor.set_cursor_line_style(Style::default().bg(THEME.cursor_line));
+  editor.move_cursor(CursorMove::Bottom);
+  editor.move_cursor(CursorMove::End);
+  editor
+}
+
+fn row_read_only_reason(form: &RowDetail) -> String {
+  let Some(source) = &form.source else {
+    return "Custom SQL results are read-only".into();
+  };
+  if !source.columns.iter().any(|column| column.primary_key) {
+    return "This table has no primary key; the row is read-only".into();
+  }
+  "This generated column is read-only".into()
+}
+
 // Edits at Unicode scalar boundaries so non-ASCII input cannot corrupt a field.
 fn edit_single_line(value: &mut String, cursor: &mut usize, key: KeyEvent) {
   match key.code {
@@ -973,5 +1194,88 @@ mod tests {
       KeyCode::Enter,
       KeyModifiers::NONE
     )));
+  }
+
+  #[test]
+  fn edits_and_nulls_supported_row_values() {
+    // Direct table metadata enables edits but keeps generated fields read-only.
+    let result = editable_result();
+    let mut form = RowDetail::new(&result, 0).unwrap();
+
+    assert!(form.row_is_editable());
+    assert!(form.selected_is_editable());
+    form.move_selection(1);
+    assert_eq!(form.selected_value(), Some("before"));
+    form.begin_edit();
+    form
+      .editor
+      .input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    form.finish_edit();
+    assert_eq!(form.selected_value(), Some("beforea"));
+
+    form.toggle_null();
+    assert_eq!(form.selected_value(), None);
+    form.move_selection(1);
+    assert!(!form.selected_is_editable());
+  }
+
+  #[test]
+  fn custom_query_rows_are_read_only() {
+    // Custom SQL has no stable table identity for a safe generated UPDATE.
+    let result = QueryResult {
+      columns: vec!["value".into()],
+      rows: vec![vec![Some("42".into())]],
+      ..Default::default()
+    };
+    let form = RowDetail::new(&result, 0).unwrap();
+
+    assert!(!form.row_is_editable());
+    assert!(!form.selected_is_editable());
+    assert_eq!(
+      row_read_only_reason(&form),
+      "Custom SQL results are read-only"
+    );
+  }
+
+  // Keeps row-editor tests compact while retaining real PostgreSQL metadata.
+  fn editable_result() -> QueryResult {
+    QueryResult {
+      columns: vec!["id".into(), "name".into(), "slug".into()],
+      rows: vec![vec![
+        Some("7".into()),
+        Some("before".into()),
+        Some("generated".into()),
+      ]],
+      source: Some(db::TableResultSource {
+        table: TableRef {
+          profile_id: "local".into(),
+          database: "postgres".into(),
+          schema: "public".into(),
+          name: "items".into(),
+          kind: "table".into(),
+        },
+        columns: vec![
+          db::ResultColumn {
+            name: "id".into(),
+            type_name: "integer".into(),
+            editable: true,
+            primary_key: true,
+          },
+          db::ResultColumn {
+            name: "name".into(),
+            type_name: "text".into(),
+            editable: true,
+            primary_key: false,
+          },
+          db::ResultColumn {
+            name: "slug".into(),
+            type_name: "text".into(),
+            editable: false,
+            primary_key: false,
+          },
+        ],
+      }),
+      ..Default::default()
+    }
   }
 }

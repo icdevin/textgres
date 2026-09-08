@@ -6,7 +6,7 @@ The initial application supports:
 
 - Saved connection profiles and passwords.
 - An expandable `connection → database → schema → table` explorer.
-- Read-only table previews.
+- Table previews with an expanded row viewer and primary-key-safe editing.
 - Multi-line SQL editing with live syntax highlighting and execution.
 - Saved SQL scripts.
 - Bounded result rendering with vertical and horizontal navigation.
@@ -39,6 +39,9 @@ when a connection does not have a saved password.
 | SQL | `Ctrl+L` | Open the saved-script picker |
 | SQL | `Ctrl+Up` / `Ctrl+Down` | Resize the SQL editor |
 | Results | `j` / `k`, arrows | Move through rows or columns |
+| Results | `Enter` | Inspect the selected row |
+| Row viewer | arrows, `Enter` | Select and edit a field |
+| Row viewer | `Ctrl+N` / `Ctrl+S` | Toggle `NULL` or save the row |
 
 Connection forms use `Tab` to move between fields and `Ctrl+S` to save. The TLS
 field uses `Space` to toggle between disabled and required.
@@ -63,7 +66,9 @@ This sends the standard enhanced-key sequence that Textgres reads as `Ctrl+Enter
 - TLS uses the operating system trust store and verifies server certificates.
 - Queries time out after 30 seconds.
 - The UI keeps at most 500 rows from a custom query and 200 rows from a table preview.
-- Textgres does not provide row editing. Custom SQL is unrestricted and can still modify data.
+- Direct table previews are editable only when the table has a primary key. Updates use the
+  original key and edited values to detect conflicts. Custom SQL results and views are read-only.
+- Custom SQL is unrestricted and can modify data.
 
 ## Development
 

@@ -8,6 +8,7 @@ use tokio_postgres::{
   Config, SimpleQueryMessage,
   config::SslMode,
   error::{DbError, ErrorPosition},
+  types::ToSql,
 };
 
 use crate::storage::ConnectionProfile;
@@ -24,6 +25,22 @@ pub struct TableRef {
   pub kind: String,
 }
 
+/// Database metadata required to validate and encode one editable column.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResultColumn {
+  pub name: String,
+  pub type_name: String,
+  pub editable: bool,
+  pub primary_key: bool,
+}
+
+/// Direct table previews retain the source needed for safe row updates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableResultSource {
+  pub table: TableRef,
+  pub columns: Vec<ResultColumn>,
+}
+
 /// The bounded table model rendered by the results pane.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryResult {
@@ -31,6 +48,7 @@ pub struct QueryResult {
   pub rows: Vec<Vec<Option<String>>>,
   pub status: String,
   pub truncated: bool,
+  pub source: Option<TableResultSource>,
 }
 
 /// Each request is self-contained so no connection can outlive its owning task.
@@ -62,6 +80,13 @@ pub enum Request {
     database: String,
     sql: String,
   },
+  UpdateRow {
+    profile: ConnectionProfile,
+    password: Option<String>,
+    source: TableResultSource,
+    original: Vec<Option<String>>,
+    values: Vec<Option<String>>,
+  },
 }
 
 /// Typed output prevents the UI from accepting a response for the wrong node.
@@ -83,6 +108,7 @@ pub enum Output {
     tables: Vec<TableRef>,
   },
   Result(QueryResult),
+  Updated(QueryResult),
 }
 
 /// A worker response always resolves the UI's one active operation.
@@ -225,12 +251,7 @@ async fn execute(request: Request) -> anyhow::Result<Output> {
       table,
     } => {
       let client = connect(&profile, password.as_deref(), &table.database).await?;
-      let sql = format!(
-        "SELECT * FROM {}.{} LIMIT 200",
-        quote_identifier(&table.schema),
-        quote_identifier(&table.name)
-      );
-      Ok(Output::Result(run_query(&client, &sql).await?))
+      Ok(Output::Result(preview_table(&client, table).await?))
     }
     Request::Query {
       profile,
@@ -241,7 +262,162 @@ async fn execute(request: Request) -> anyhow::Result<Output> {
       let client = connect(&profile, password.as_deref(), &database).await?;
       Ok(Output::Result(run_query(&client, &sql).await?))
     }
+    Request::UpdateRow {
+      profile,
+      password,
+      source,
+      original,
+      values,
+    } => {
+      let client = connect(&profile, password.as_deref(), &source.table.database).await?;
+      update_row(&client, &source, &original, &values).await?;
+      Ok(Output::Updated(preview_table(&client, source.table).await?))
+    }
   }
+}
+
+async fn preview_table(
+  client: &tokio_postgres::Client,
+  table: TableRef,
+) -> anyhow::Result<QueryResult> {
+  let columns = table_columns(client, &table).await?;
+  let sql = format!(
+    "SELECT * FROM {}.{} LIMIT 200",
+    quote_identifier(&table.schema),
+    quote_identifier(&table.name)
+  );
+  let mut result = run_query(client, &sql).await?;
+  // Disable updates when metadata and result columns do not align exactly.
+  if columns
+    .iter()
+    .map(|column| &column.name)
+    .eq(&result.columns)
+  {
+    result.source = Some(TableResultSource { table, columns });
+  }
+  Ok(result)
+}
+
+async fn table_columns(
+  client: &tokio_postgres::Client,
+  table: &TableRef,
+) -> anyhow::Result<Vec<ResultColumn>> {
+  let rows = client
+    .query(
+      "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+              a.attgenerated = '', \
+              EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid \
+                AND i.indisprimary AND a.attnum = ANY(i.indkey::smallint[])) \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = c.oid \
+        WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+        ORDER BY a.attnum",
+      &[&table.schema, &table.name],
+    )
+    .await?;
+  let table_is_editable = matches!(table.kind.as_str(), "table" | "partitioned table");
+  Ok(
+    rows
+      .into_iter()
+      .map(|row| ResultColumn {
+        name: row.get(0),
+        type_name: row.get(1),
+        editable: table_is_editable && row.get(2),
+        primary_key: row.get(3),
+      })
+      .collect(),
+  )
+}
+
+async fn update_row(
+  client: &tokio_postgres::Client,
+  source: &TableResultSource,
+  original: &[Option<String>],
+  values: &[Option<String>],
+) -> anyhow::Result<()> {
+  let (sql, parameters) = build_update(source, original, values)?;
+  let parameter_refs = parameters
+    .iter()
+    .map(|value| value as &(dyn ToSql + Sync))
+    .collect::<Vec<_>>();
+  client
+    .batch_execute("SET statement_timeout = '30s'")
+    .await?;
+  let affected = client.execute(&sql, &parameter_refs).await?;
+  anyhow::ensure!(
+    affected == 1,
+    "row update conflict: expected one matching row, found {affected}"
+  );
+  Ok(())
+}
+
+// Build typed parameters from catalog metadata; never interpolate edited values.
+fn build_update(
+  source: &TableResultSource,
+  original: &[Option<String>],
+  values: &[Option<String>],
+) -> anyhow::Result<(String, Vec<Option<String>>)> {
+  anyhow::ensure!(
+    source.columns.len() == original.len() && original.len() == values.len(),
+    "row data does not match the table metadata"
+  );
+  let changed = source
+    .columns
+    .iter()
+    .enumerate()
+    .filter(|(index, column)| column.editable && original[*index] != values[*index])
+    .collect::<Vec<_>>();
+  anyhow::ensure!(!changed.is_empty(), "the row has no editable changes");
+  let keys = source
+    .columns
+    .iter()
+    .enumerate()
+    .filter(|(_, column)| column.primary_key)
+    .collect::<Vec<_>>();
+  anyhow::ensure!(!keys.is_empty(), "the table has no primary key");
+
+  let mut parameters = Vec::new();
+  let assignments = changed
+    .iter()
+    .map(|(index, column)| {
+      parameters.push(values[*index].clone());
+      format!(
+        "{} = ${}::text::{}",
+        quote_identifier(&column.name),
+        parameters.len(),
+        column.type_name
+      )
+    })
+    .collect::<Vec<_>>();
+  let mut predicate_columns = keys;
+  // Match original edited values too, so a concurrent edit is not overwritten.
+  predicate_columns.extend(
+    changed
+      .iter()
+      .copied()
+      .filter(|(_, column)| !column.primary_key),
+  );
+  let predicates = predicate_columns
+    .iter()
+    .map(|(index, column)| {
+      parameters.push(original[*index].clone());
+      format!(
+        "{} IS NOT DISTINCT FROM ${}::text::{}",
+        quote_identifier(&column.name),
+        parameters.len(),
+        column.type_name
+      )
+    })
+    .collect::<Vec<_>>();
+  let sql = format!(
+    "UPDATE {}.{} SET {} WHERE {}",
+    quote_identifier(&source.table.schema),
+    quote_identifier(&source.table.name),
+    assignments.join(", "),
+    predicates.join(" AND ")
+  );
+  Ok((sql, parameters))
 }
 
 async fn connect(
@@ -358,5 +534,55 @@ mod tests {
       lines.join("\n"),
       "SQL Error [42P01]: ERROR: relation \"derp\" does not exist\nPosition: 52"
     );
+  }
+
+  #[test]
+  fn builds_primary_key_update_with_typed_parameters() {
+    let source = TableResultSource {
+      table: TableRef {
+        profile_id: "local".into(),
+        database: "postgres".into(),
+        schema: "odd schema".into(),
+        name: "user".into(),
+        kind: "table".into(),
+      },
+      columns: vec![
+        ResultColumn {
+          name: "id".into(),
+          type_name: "integer".into(),
+          editable: true,
+          primary_key: true,
+        },
+        ResultColumn {
+          name: "display name".into(),
+          type_name: "text".into(),
+          editable: true,
+          primary_key: false,
+        },
+      ],
+    };
+
+    let (sql, parameters) = build_update(
+      &source,
+      &[Some("7".into()), Some("before".into())],
+      &[Some("7".into()), Some("after'; DROP TABLE x".into())],
+    )
+    .unwrap();
+
+    assert_eq!(
+      sql,
+      "UPDATE \"odd schema\".\"user\" SET \"display name\" = $1::text::text \
+       WHERE \"id\" IS NOT DISTINCT FROM $2::text::integer AND \
+       \"display name\" IS NOT DISTINCT FROM $3::text::text"
+    );
+    assert_eq!(
+      parameters,
+      vec![
+        Some("after'; DROP TABLE x".into()),
+        Some("7".into()),
+        Some("before".into())
+      ]
+    );
+    assert!(!sql.contains("DROP"));
   }
 }
