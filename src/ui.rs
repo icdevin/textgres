@@ -253,7 +253,7 @@ fn draw_shortcuts(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
   if let Some(overlay) = &app.overlay {
     return match overlay {
-      Overlay::Connection(form) if form.selected_field() == ConnectionField::RequireTls => {
+      Overlay::Connection(form) if form.selected_field().is_toggle() => {
         vec![
           ("Space", "toggle"),
           ("Tab", "field"),
@@ -339,7 +339,7 @@ fn shortcut_line(shortcuts: &[(&'static str, &'static str)]) -> Line<'static> {
 fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
   match overlay {
     Overlay::Connection(form) => {
-      let area = centered(frame.area(), 66, 20);
+      let area = centered(frame.area(), 70, 18);
       frame.render_widget(Clear, area);
       let title = if form.editing_id.is_some() {
         " Edit connection "
@@ -352,12 +352,40 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
         .title(title);
       let inner = block.inner(area);
       frame.render_widget(block, area);
-      let fields = Layout::vertical([Constraint::Length(2); 7]).split(inner);
+      // Compact section boxes separate database and tunnel settings without blank rows.
+      let sections = Layout::vertical([Constraint::Length(9), Constraint::Length(7)]).split(inner);
+      let database_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.cyan))
+        .title(" PostgreSQL ");
+      let database_inner = database_block.inner(sections[0]);
+      frame.render_widget(database_block, sections[0]);
+      let ssh_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.purple))
+        .title(" SSH ");
+      let ssh_inner = ssh_block.inner(sections[1]);
+      frame.render_widget(ssh_block, sections[1]);
+      let mut fields = Layout::vertical([Constraint::Length(1); 7])
+        .split(database_inner)
+        .to_vec();
+      fields.extend(
+        Layout::vertical([Constraint::Length(1); 5])
+          .split(ssh_inner)
+          .iter()
+          .copied(),
+      );
       for (index, field) in ConnectionField::ALL.iter().copied().enumerate() {
         let selected = index == form.field;
         let value = match field {
           ConnectionField::RequireTls => if form.require_tls {
             "required"
+          } else {
+            "disabled"
+          }
+          .to_owned(),
+          ConnectionField::SshTunnel => if form.ssh_enabled {
+            "enabled"
           } else {
             "disabled"
           }
@@ -380,7 +408,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
           ])),
           fields[index],
         );
-        if selected && field != ConnectionField::RequireTls {
+        if selected && !field.is_toggle() {
           let cursor_x = fields[index]
             .x
             .saturating_add(24)
@@ -669,6 +697,7 @@ mod tests {
       user: "postgres".into(),
       password: Some("secret".into()),
       require_tls: false,
+      ssh: None,
     };
     let mut app = App::new(
       storage,
@@ -822,7 +851,18 @@ mod tests {
       .collect::<String>();
     assert!(form.contains("localhost"));
     assert!(form.contains("Password (saved):"));
+    assert!(form.contains("Enabled:"));
+    assert!(form.contains("Identity file:"));
     assert!(!form.contains("secret"));
+    // The SSH section uses a distinct outline from PostgreSQL settings.
+    assert!(
+      terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|cell| { matches!(cell.symbol(), "│" | "─") && cell.fg == THEME.purple })
+    );
 
     // Errors and shortcuts occupy independent full-width footer rows.
     app.overlay = None;

@@ -29,6 +29,18 @@ pub struct ConnectionProfile {
   pub password: Option<String>,
   #[serde(default)]
   pub require_tls: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub ssh: Option<SshConfig>,
+}
+
+/// OpenSSH settings forward the saved PostgreSQL host through one jump host.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SshConfig {
+  pub host: String,
+  pub port: u16,
+  pub user: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub identity_file: Option<String>,
 }
 
 // Prevent diagnostics from copying a saved password into logs or panic output.
@@ -44,6 +56,7 @@ impl fmt::Debug for ConnectionProfile {
       .field("user", &self.user)
       .field("password", &self.password.as_ref().map(|_| "<redacted>"))
       .field("require_tls", &self.require_tls)
+      .field("ssh", &self.ssh)
       .finish()
   }
 }
@@ -64,7 +77,7 @@ struct ConnectionFile {
 }
 
 const fn format_version() -> u8 {
-  2
+  3
 }
 
 /// Owns all durable paths so storage behavior stays separate from UI state.
@@ -103,8 +116,8 @@ impl Storage {
       fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
     let file: ConnectionFile =
       toml::from_str(&source).with_context(|| format!("could not parse {}", path.display()))?;
-    // Version 1 profiles had no password and deserialize with `None`.
-    if !matches!(file.version, 1 | 2) {
+    // Older profiles omit password or SSH settings and use Serde defaults.
+    if !(1..=format_version()).contains(&file.version) {
       bail!(
         "unsupported connection format version {} in {}",
         file.version,
@@ -228,6 +241,14 @@ fn validate_profile(profile: &ConnectionProfile) -> anyhow::Result<()> {
   if profile.port == 0 {
     bail!("connection port must be greater than zero");
   }
+  if let Some(ssh) = &profile.ssh {
+    if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
+      bail!("SSH host and user must not be empty");
+    }
+    if ssh.port == 0 {
+      bail!("SSH port must be greater than zero");
+    }
+  }
   Ok(())
 }
 
@@ -257,6 +278,12 @@ mod tests {
       user: "postgres".into(),
       password: Some("secret".into()),
       require_tls: false,
+      ssh: Some(SshConfig {
+        host: "gateway.example.com".into(),
+        port: 22,
+        user: "devin".into(),
+        identity_file: Some("~/.ssh/id_ed25519".into()),
+      }),
     }
   }
 
@@ -270,7 +297,8 @@ mod tests {
     assert_eq!(storage.load_connections().unwrap(), vec![profile()]);
     let source = fs::read_to_string(storage.root().join(CONNECTIONS_FILE)).unwrap();
     assert!(source.contains("password = \"secret\""));
-    assert!(source.contains("version = 2"));
+    assert!(source.contains("version = 3"));
+    assert!(source.contains("host = \"gateway.example.com\""));
   }
 
   #[test]
@@ -319,6 +347,7 @@ require_tls = false
     let profiles = storage.load_connections().unwrap();
 
     assert_eq!(profiles[0].password, None);
+    assert_eq!(profiles[0].ssh, None);
   }
 
   #[test]

@@ -14,7 +14,7 @@ use tokio::runtime::Handle;
 use crate::{
   db::{self, Output, QueryResult, Request, Response, TableRef},
   sql_editor::SqlEditor,
-  storage::{ConnectionProfile, Storage},
+  storage::{ConnectionProfile, SshConfig, Storage},
   theme::THEME,
 };
 
@@ -75,10 +75,15 @@ pub enum ConnectionField {
   User,
   Password,
   RequireTls,
+  SshTunnel,
+  SshHost,
+  SshPort,
+  SshUser,
+  SshIdentityFile,
 }
 
 impl ConnectionField {
-  pub const ALL: [Self; 7] = [
+  pub const ALL: [Self; 12] = [
     Self::Name,
     Self::Host,
     Self::Port,
@@ -86,6 +91,11 @@ impl ConnectionField {
     Self::User,
     Self::Password,
     Self::RequireTls,
+    Self::SshTunnel,
+    Self::SshHost,
+    Self::SshPort,
+    Self::SshUser,
+    Self::SshIdentityFile,
   ];
 
   pub const fn label(self) -> &'static str {
@@ -97,7 +107,33 @@ impl ConnectionField {
       Self::User => "User",
       Self::Password => "Password (saved)",
       Self::RequireTls => "TLS",
+      Self::SshTunnel => "Enabled",
+      Self::SshHost => "Host",
+      Self::SshPort => "Port",
+      Self::SshUser => "User",
+      Self::SshIdentityFile => "Identity file",
     }
+  }
+
+  // Toggle fields live outside the text array, so indexes stay explicit.
+  const fn text_index(self) -> Option<usize> {
+    match self {
+      Self::Name => Some(0),
+      Self::Host => Some(1),
+      Self::Port => Some(2),
+      Self::Database => Some(3),
+      Self::User => Some(4),
+      Self::Password => Some(5),
+      Self::SshHost => Some(6),
+      Self::SshPort => Some(7),
+      Self::SshUser => Some(8),
+      Self::SshIdentityFile => Some(9),
+      Self::RequireTls | Self::SshTunnel => None,
+    }
+  }
+
+  pub const fn is_toggle(self) -> bool {
+    matches!(self, Self::RequireTls | Self::SshTunnel)
   }
 }
 
@@ -105,8 +141,9 @@ impl ConnectionField {
 #[derive(Clone, Debug)]
 pub struct ConnectionForm {
   pub editing_id: Option<String>,
-  pub values: [String; 6],
+  pub values: [String; 10],
   pub require_tls: bool,
+  pub ssh_enabled: bool,
   pub field: usize,
   pub cursor: usize,
 }
@@ -122,14 +159,20 @@ impl ConnectionForm {
         "postgres".into(),
         std::env::var("USER").unwrap_or_default(),
         String::new(),
+        String::new(),
+        "22".into(),
+        std::env::var("USER").unwrap_or_default(),
+        String::new(),
       ],
       require_tls: false,
+      ssh_enabled: false,
       field: 0,
       cursor: 0,
     }
   }
 
   fn edit(profile: &ConnectionProfile) -> Self {
+    let ssh = profile.ssh.as_ref();
     Self {
       editing_id: Some(profile.id.clone()),
       values: [
@@ -140,8 +183,18 @@ impl ConnectionForm {
         profile.user.clone(),
         // Preload the value so saving an edit preserves the masked password.
         profile.password.clone().unwrap_or_default(),
+        ssh.map_or_else(String::new, |ssh| ssh.host.clone()),
+        ssh.map_or_else(|| "22".into(), |ssh| ssh.port.to_string()),
+        ssh.map_or_else(
+          || std::env::var("USER").unwrap_or_default(),
+          |ssh| ssh.user.clone(),
+        ),
+        ssh
+          .and_then(|ssh| ssh.identity_file.clone())
+          .unwrap_or_default(),
       ],
       require_tls: profile.require_tls,
+      ssh_enabled: ssh.is_some(),
       field: 0,
       cursor: profile.name.chars().count(),
     }
@@ -152,9 +205,7 @@ impl ConnectionForm {
   }
 
   pub fn value(&self, field: ConnectionField) -> Option<&str> {
-    let index = ConnectionField::ALL
-      .iter()
-      .position(|item| *item == field)?;
+    let index = field.text_index()?;
     self.values.get(index).map(String::as_str)
   }
 
@@ -162,13 +213,15 @@ impl ConnectionForm {
     self.field =
       (self.field as isize + change).rem_euclid(ConnectionField::ALL.len() as isize) as usize;
     self.cursor = self
-      .values
-      .get(self.field)
+      .value(self.selected_field())
       .map_or(0, |value| value.chars().count());
   }
 
   fn handle_text_key(&mut self, key: KeyEvent) {
-    let Some(value) = self.values.get_mut(self.field) else {
+    let Some(index) = self.selected_field().text_index() else {
+      return;
+    };
+    let Some(value) = self.values.get_mut(index) else {
       return;
     };
     edit_single_line(value, &mut self.cursor, key);
@@ -261,7 +314,7 @@ impl RowDetail {
 /// Only one overlay exists at once, which prevents conflicting key handlers.
 #[derive(Clone, Debug)]
 pub enum Overlay {
-  Connection(ConnectionForm),
+  Connection(Box<ConnectionForm>),
   SaveScript { name: String, cursor: usize },
   LoadScript { selected: usize },
   RowDetail(Box<RowDetail>),
@@ -294,6 +347,7 @@ pub struct App {
   storage: Storage,
   runtime: Handle,
   database_tx: Sender<Response>,
+  tunnels: db::TunnelManager,
 }
 
 impl App {
@@ -330,6 +384,7 @@ impl App {
       storage,
       runtime,
       database_tx,
+      tunnels: db::TunnelManager::default(),
     }
   }
 
@@ -517,7 +572,10 @@ impl App {
       KeyCode::End | KeyCode::Char('G') => self.explorer_selected = row_count.saturating_sub(1),
       KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => self.activate_selected(),
       KeyCode::Left => self.collapse_selected(),
-      KeyCode::Char('n') => self.overlay = Some(Overlay::Connection(ConnectionForm::new())),
+      KeyCode::Char('n') => {
+        // Keep the larger multi-section form outside the compact overlay enum.
+        self.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::new())));
+      }
       KeyCode::Char('e') => self.edit_selected_connection(),
       KeyCode::Char('d') => self.confirm_delete_selected_connection(),
       _ => {}
@@ -604,6 +662,9 @@ impl App {
           KeyCode::BackTab | KeyCode::Up => form.move_field(-1),
           KeyCode::Char(' ') if form.selected_field() == ConnectionField::RequireTls => {
             form.require_tls = !form.require_tls
+          }
+          KeyCode::Char(' ') if form.selected_field() == ConnectionField::SshTunnel => {
+            form.ssh_enabled = !form.ssh_enabled
           }
           _ => form.handle_text_key(key),
         }
@@ -928,17 +989,46 @@ impl App {
   fn dispatch(&mut self, description: String, request: Request) {
     self.busy = Some(description.clone());
     self.set_status(description, false);
-    db::spawn(&self.runtime, self.database_tx.clone(), request);
+    db::spawn(
+      &self.runtime,
+      self.database_tx.clone(),
+      self.tunnels.clone(),
+      request,
+    );
   }
 
   fn save_connection(&mut self, form: &ConnectionForm) -> Result<(), String> {
+    if self.busy.is_some() {
+      return Err("Wait for the current database operation to finish".into());
+    }
     let port = form.values[2]
       .parse::<u16>()
       .map_err(|_| "Port must be an integer from 1 through 65535".to_owned())?;
     if form.values[..5].iter().any(|value| value.trim().is_empty()) {
       return Err("Name, host, port, database, and user are required".into());
     }
+    let ssh = if form.ssh_enabled {
+      if form.values[6].trim().is_empty() || form.values[8].trim().is_empty() {
+        return Err("SSH host and user are required".into());
+      }
+      let ssh_port = form.values[7]
+        .parse::<u16>()
+        .map_err(|_| "SSH port must be an integer from 1 through 65535".to_owned())?;
+      Some(SshConfig {
+        host: form.values[6].trim().to_owned(),
+        port: ssh_port,
+        user: form.values[8].trim().to_owned(),
+        identity_file: (!form.values[9].trim().is_empty())
+          .then(|| form.values[9].trim().to_owned()),
+      })
+    } else {
+      None
+    };
     let id = form.editing_id.clone().unwrap_or_else(new_id);
+    self
+      .tunnels
+      .invalidate(&id)
+      .map_err(|error| format!("Could not close the previous SSH tunnel: {error:#}"))?;
     let profile = ConnectionProfile {
       id: id.clone(),
       name: form.values[0].trim().to_owned(),
@@ -948,6 +1038,7 @@ impl App {
       user: form.values[4].trim().to_owned(),
       password: (!form.values[5].is_empty()).then(|| form.values[5].clone()),
       require_tls: form.require_tls,
+      ssh,
     };
     // Persist a candidate first so a disk error cannot leave memory and disk divergent.
     let mut profiles = self.profiles.clone();
@@ -989,7 +1080,7 @@ impl App {
       return;
     };
     if let Some(profile) = self.profile(&profile_id) {
-      self.overlay = Some(Overlay::Connection(ConnectionForm::edit(profile)));
+      self.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::edit(profile))));
     }
   }
 
@@ -1010,6 +1101,17 @@ impl App {
   }
 
   fn delete_connection(&mut self, profile_id: &str) {
+    if self.busy.is_some() {
+      self.set_status(
+        "Wait for the current database operation to finish".into(),
+        true,
+      );
+      return;
+    }
+    if let Err(error) = self.tunnels.invalidate(profile_id) {
+      self.set_status(format!("Could not close the SSH tunnel: {error:#}"), true);
+      return;
+    }
     let previous = self.profiles.clone();
     self.profiles.retain(|profile| profile.id != profile_id);
     if let Err(error) = self.storage.save_connections(&self.profiles) {
@@ -1234,6 +1336,41 @@ mod tests {
     assert_eq!(
       row_read_only_reason(&form),
       "Custom SQL results are read-only"
+    );
+  }
+
+  #[test]
+  fn connection_form_preserves_ssh_settings() {
+    // Editing must not silently remove tunnel authentication settings.
+    let profile = ConnectionProfile {
+      id: "remote".into(),
+      name: "Remote".into(),
+      host: "db.internal".into(),
+      port: 5432,
+      database: "postgres".into(),
+      user: "postgres".into(),
+      password: None,
+      require_tls: true,
+      ssh: Some(SshConfig {
+        host: "gateway.example.com".into(),
+        port: 2222,
+        user: "devin".into(),
+        identity_file: Some("~/.ssh/work".into()),
+      }),
+    };
+
+    let form = ConnectionForm::edit(&profile);
+
+    assert!(form.ssh_enabled);
+    assert_eq!(
+      form.value(ConnectionField::SshHost),
+      Some("gateway.example.com")
+    );
+    assert_eq!(form.value(ConnectionField::SshPort), Some("2222"));
+    assert_eq!(form.value(ConnectionField::SshUser), Some("devin"));
+    assert_eq!(
+      form.value(ConnectionField::SshIdentityFile),
+      Some("~/.ssh/work")
     );
   }
 

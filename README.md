@@ -5,6 +5,7 @@ Textgres is a PostgreSQL-specific exploration TUI built with Ratatui.
 The initial application supports:
 
 - Saved connection profiles and passwords.
+- Persistent SSH tunnels through the local OpenSSH client.
 - An expandable `connection → database → schema → table` explorer.
 - Table previews with an expanded row viewer and primary-key-safe editing.
 - Multi-line SQL editing with live syntax highlighting and execution.
@@ -18,6 +19,14 @@ Install a current stable Rust toolchain, then run:
 ```sh
 cargo run
 ```
+
+SSH tunnels require the `ssh` command. Authentication uses `ssh-agent`, OpenSSH
+configuration, or the optional identity file in the connection form. Add the SSH
+host key to `known_hosts` before connecting; Textgres does not bypass host-key checks.
+
+For a tunnelled connection, the PostgreSQL host and port are the endpoint as seen
+from the SSH host. The SSH host can be an alias from `~/.ssh/config`, including an
+alias that uses `ProxyJump`.
 
 Textgres stores data in the platform application-data directory. Set
 `TEXTGRES_DATA_DIR` to override that location. `PGPASSWORD` provides a password
@@ -63,6 +72,8 @@ This sends the standard enhanced-key sequence that Textgres reads as `Ctrl+Enter
 
 - Passwords are stored as plain text in the connection file. On Unix, Textgres
   restricts this file to the current user (`0600`).
+- SSH is non-interactive. Use `ssh-agent` for encrypted keys; SSH passwords and
+  key passphrase prompts are not supported inside Textgres.
 - TLS uses the operating system trust store and verifies server certificates.
 - Queries time out after 30 seconds.
 - The UI keeps at most 500 rows from a custom query and 200 rows from a table preview.
