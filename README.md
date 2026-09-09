@@ -1,5 +1,7 @@
 # Textgres
 
+![Textgres connection explorer, SQL editor, and query results](assets/textgres.png)
+
 Textgres is a PostgreSQL exploration TUI built with
 [Ratatui](https://ratatui.rs/). It provides a connection tree, SQL editor,
 result table, expanded row viewer, saved scripts, and optional SSH access.
