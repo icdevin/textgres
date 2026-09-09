@@ -5,6 +5,7 @@
 Textgres is a PostgreSQL exploration TUI built with
 [Ratatui](https://ratatui.rs/). It provides a connection tree, SQL editor,
 result table, expanded row viewer, saved scripts, and optional SSH access.
+The installed command is `tg`.
 
 Textgres is an early-stage project. It currently supports:
 
@@ -34,7 +35,7 @@ Or install the executable locally:
 
 ```sh
 cargo install --path .
-textgres
+tg
 ```
 
 ## Getting started
@@ -126,7 +127,7 @@ Textgres stores `connections.toml` and a `scripts` directory in the platform
 application-data directory. Set `TEXTGRES_DATA_DIR` to use another location:
 
 ```sh
-TEXTGRES_DATA_DIR=/path/to/textgres-data textgres
+TEXTGRES_DATA_DIR=/path/to/textgres-data tg
 ```
 
 Saved PostgreSQL passwords are plain text in `connections.toml`. On Unix, Textgres
