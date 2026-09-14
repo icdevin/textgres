@@ -110,6 +110,7 @@ The bottom bar shows controls for the active pane or dialog. `^` means `Ctrl`.
 | --- | --- | --- |
 | Global | `Tab` / `Shift+Tab` | Select the next or previous pane |
 | Global | `Ctrl+Q` | Quit |
+| Database operation | `Esc` | Cancel the current database operation |
 | Explorer | `↑` / `↓`, `j` / `k` | Move selection |
 | Explorer | `Home` / `End`, `g` / `G` | Select the first or last item |
 | Explorer | `Enter`, `Space`, `→` | Expand or activate |

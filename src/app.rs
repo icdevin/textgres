@@ -344,6 +344,8 @@ pub struct App {
   pub status: String,
   pub status_is_error: bool,
   pending_row_edit: Option<RowDetail>,
+  database_task: Option<db::Task>,
+  next_operation_id: u64,
   storage: Storage,
   runtime: Handle,
   database_tx: Sender<Response>,
@@ -381,6 +383,8 @@ impl App {
       status: "Ready".into(),
       status_is_error: false,
       pending_row_edit: None,
+      database_task: None,
+      next_operation_id: 1,
       storage,
       runtime,
       database_tx,
@@ -465,6 +469,10 @@ impl App {
       self.should_quit = true;
       return;
     }
+    if key.code == KeyCode::Esc && self.database_task.is_some() {
+      self.cancel_database_operation();
+      return;
+    }
     match key.code {
       KeyCode::Tab => {
         self.focus = match self.focus {
@@ -492,8 +500,17 @@ impl App {
     }
   }
 
-  /// Applies typed worker output and always clears the busy state.
+  /// Applies output only when it belongs to the active operation.
   pub fn handle_database_response(&mut self, response: Response) {
+    if self
+      .database_task
+      .as_ref()
+      .is_none_or(|task| task.operation_id() != response.operation_id)
+    {
+      // A cancelled task can have queued its response before Escape was handled.
+      return;
+    }
+    self.database_task = None;
     self.busy = None;
     match response.result {
       Ok(Output::Databases { profile_id, names }) => {
@@ -987,14 +1004,35 @@ impl App {
   }
 
   fn dispatch(&mut self, description: String, request: Request) {
+    // One operation at a time keeps cancellation and response ownership exact.
+    debug_assert!(self.database_task.is_none());
+    let operation_id = self.next_operation_id;
+    self.next_operation_id = self.next_operation_id.wrapping_add(1);
     self.busy = Some(description.clone());
     self.set_status(description, false);
-    db::spawn(
+    self.database_task = Some(db::spawn(
       &self.runtime,
       self.database_tx.clone(),
       self.tunnels.clone(),
+      operation_id,
       request,
-    );
+    ));
+  }
+
+  fn cancel_database_operation(&mut self) {
+    let Some(task) = self.database_task.take() else {
+      return;
+    };
+    let description = self
+      .busy
+      .take()
+      .unwrap_or_else(|| "database operation".into());
+    task.cancel();
+    if let Some(form) = self.pending_row_edit.take() {
+      // Preserve unsaved edits when a row update is cancelled.
+      self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+    }
+    self.set_status(format!("Cancelled: {description}"), false);
   }
 
   fn save_connection(&mut self, form: &ConnectionForm) -> Result<(), String> {
@@ -1296,6 +1334,58 @@ mod tests {
       KeyCode::Enter,
       KeyModifiers::NONE
     )));
+  }
+
+  // Escape must cancel immediately and reject a response queued by the old task.
+  #[test]
+  fn escape_cancels_the_active_database_operation() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    let profile = ConnectionProfile {
+      id: "local".into(),
+      name: "Local".into(),
+      host: "192.0.2.1".into(),
+      port: 5432,
+      database: "postgres".into(),
+      user: "postgres".into(),
+      password: None,
+      require_tls: false,
+      ssh: None,
+    };
+    let mut app = App::new(
+      storage,
+      vec![profile.clone()],
+      Vec::new(),
+      runtime.handle().clone(),
+      sender,
+    );
+    app.dispatch(
+      "Connecting to Local".into(),
+      Request::Databases {
+        profile,
+        password: None,
+      },
+    );
+    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(app.busy.is_none());
+    assert!(app.database_task.is_none());
+    assert_eq!(app.status, "Cancelled: Connecting to Local");
+    app.handle_database_response(Response {
+      operation_id,
+      result: Ok(Output::Databases {
+        profile_id: "local".into(),
+        names: vec!["must_be_ignored".into()],
+      }),
+    });
+    assert!(!app.databases.contains_key("local"));
+    assert_eq!(app.status, "Cancelled: Connecting to Local");
   }
 
   #[test]

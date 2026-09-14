@@ -3,7 +3,11 @@ use std::{
   io::{self, Read},
   net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
   process::{Child, Command, Stdio},
-  sync::{Arc, Mutex, mpsc::Sender},
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc::Sender,
+  },
   thread,
   time::{Duration, Instant},
 };
@@ -120,10 +124,37 @@ pub enum Output {
   Updated(QueryResult),
 }
 
-/// A worker response always resolves the UI's one active operation.
+/// An operation ID lets the UI reject output that was queued before cancellation.
 #[derive(Debug)]
 pub struct Response {
+  pub operation_id: u64,
   pub result: anyhow::Result<Output>,
+}
+
+/// A task handle cancels async I/O and signals blocking SSH setup on drop.
+pub struct Task {
+  operation_id: u64,
+  cancelled: Arc<AtomicBool>,
+  abort_handle: tokio::task::AbortHandle,
+}
+
+impl Task {
+  pub const fn operation_id(&self) -> u64 {
+    self.operation_id
+  }
+
+  pub fn cancel(&self) {
+    // spawn_blocking cannot be aborted, so it must also observe this flag.
+    self.cancelled.store(true, Ordering::SeqCst);
+    self.abort_handle.abort();
+  }
+}
+
+impl Drop for Task {
+  fn drop(&mut self) {
+    // App shutdown must not leave an in-progress database task detached.
+    self.cancel();
+  }
 }
 
 /// Shared tunnel state avoids a new SSH login for each explorer request.
@@ -155,7 +186,11 @@ impl TunnelManager {
     Ok(())
   }
 
-  async fn endpoint(&self, profile: &ConnectionProfile) -> anyhow::Result<Option<u16>> {
+  async fn endpoint(
+    &self,
+    profile: &ConnectionProfile,
+    cancelled: Arc<AtomicBool>,
+  ) -> anyhow::Result<Option<u16>> {
     let Some(ssh) = &profile.ssh else {
       return Ok(None);
     };
@@ -166,17 +201,24 @@ impl TunnelManager {
       ssh: ssh.clone(),
     };
     let manager = self.clone();
-    tokio::task::spawn_blocking(move || manager.endpoint_blocking(profile_id, settings))
+    tokio::task::spawn_blocking(move || manager.endpoint_blocking(profile_id, settings, &cancelled))
       .await
       .context("SSH tunnel worker stopped unexpectedly")?
       .map(Some)
   }
 
-  fn endpoint_blocking(&self, profile_id: String, settings: TunnelSettings) -> anyhow::Result<u16> {
+  fn endpoint_blocking(
+    &self,
+    profile_id: String,
+    settings: TunnelSettings,
+    cancelled: &AtomicBool,
+  ) -> anyhow::Result<u16> {
+    ensure_not_cancelled(cancelled)?;
     let mut tunnels = self
       .tunnels
       .lock()
       .map_err(|_| anyhow::anyhow!("SSH tunnel state is unavailable"))?;
+    ensure_not_cancelled(cancelled)?;
     let reusable = if let Some(tunnel) = tunnels.get_mut(&profile_id) {
       tunnel.settings == settings && tunnel.process.is_running()?
     } else {
@@ -188,7 +230,8 @@ impl TunnelManager {
 
     // Replacing the entry drops any stale process before binding a new port.
     tunnels.remove(&profile_id);
-    let process = SshTunnelProcess::start(&settings)?;
+    let process = SshTunnelProcess::start(&settings, cancelled)?;
+    ensure_not_cancelled(cancelled)?;
     let local_port = process.local_port;
     tunnels.insert(profile_id, ActiveTunnel { settings, process });
     Ok(local_port)
@@ -201,7 +244,8 @@ struct SshTunnelProcess {
 }
 
 impl SshTunnelProcess {
-  fn start(settings: &TunnelSettings) -> anyhow::Result<Self> {
+  fn start(settings: &TunnelSettings, cancelled: &AtomicBool) -> anyhow::Result<Self> {
+    ensure_not_cancelled(cancelled)?;
     let local_port = reserve_local_port()?;
     let mut child = Command::new("ssh")
       .args(ssh_arguments(settings, local_port))
@@ -214,6 +258,12 @@ impl SshTunnelProcess {
     let deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
+      if cancelled.load(Ordering::SeqCst) {
+        // Stop the external process because aborting its Tokio parent cannot do so.
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("SSH connection was cancelled");
+      }
       if let Some(status) = child
         .try_wait()
         .context("could not inspect the SSH process")?
@@ -249,6 +299,14 @@ impl SshTunnelProcess {
         .is_none(),
     )
   }
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> anyhow::Result<()> {
+  anyhow::ensure!(
+    !cancelled.load(Ordering::SeqCst),
+    "database operation was cancelled"
+  );
+  Ok(())
 }
 
 impl Drop for SshTunnelProcess {
@@ -367,20 +425,50 @@ fn format_error_position(position: &ErrorPosition) -> Vec<String> {
   }
 }
 
-/// Runs database I/O outside the terminal event loop.
-pub fn spawn(runtime: &Handle, sender: Sender<Response>, tunnels: TunnelManager, request: Request) {
-  runtime.spawn(async move {
-    let result = execute(request, &tunnels).await;
+/// Runs cancellable database I/O outside the terminal event loop.
+pub fn spawn(
+  runtime: &Handle,
+  sender: Sender<Response>,
+  tunnels: TunnelManager,
+  operation_id: u64,
+  request: Request,
+) -> Task {
+  let cancelled = Arc::new(AtomicBool::new(false));
+  let worker_cancelled = cancelled.clone();
+  let join_handle = runtime.spawn(async move {
+    let result = execute(request, &tunnels, &worker_cancelled).await;
+    if worker_cancelled.load(Ordering::SeqCst) {
+      return;
+    }
     // The receiver can disappear during normal application shutdown.
-    let _ = sender.send(Response { result });
+    let _ = sender.send(Response {
+      operation_id,
+      result,
+    });
   });
+  Task {
+    operation_id,
+    cancelled,
+    abort_handle: join_handle.abort_handle(),
+  }
 }
 
-async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Output> {
+async fn execute(
+  request: Request,
+  tunnels: &TunnelManager,
+  cancelled: &Arc<AtomicBool>,
+) -> anyhow::Result<Output> {
   match request {
     Request::Databases { profile, password } => {
       let profile_id = profile.id.clone();
-      let client = connect(&profile, password.as_deref(), &profile.database, tunnels).await?;
+      let client = connect(
+        &profile,
+        password.as_deref(),
+        &profile.database,
+        tunnels,
+        cancelled,
+      )
+      .await?;
       let rows = client
         .query(
           "SELECT datname FROM pg_database \
@@ -399,7 +487,7 @@ async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Ou
       database,
     } => {
       let profile_id = profile.id.clone();
-      let client = connect(&profile, password.as_deref(), &database, tunnels).await?;
+      let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
       let rows = client
         .query(
           "SELECT nspname FROM pg_namespace \
@@ -421,7 +509,7 @@ async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Ou
       schema,
     } => {
       let profile_id = profile.id.clone();
-      let client = connect(&profile, password.as_deref(), &database, tunnels).await?;
+      let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
       let rows = client
         .query(
           "SELECT c.relname, CASE c.relkind \
@@ -456,7 +544,14 @@ async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Ou
       password,
       table,
     } => {
-      let client = connect(&profile, password.as_deref(), &table.database, tunnels).await?;
+      let client = connect(
+        &profile,
+        password.as_deref(),
+        &table.database,
+        tunnels,
+        cancelled,
+      )
+      .await?;
       Ok(Output::Result(preview_table(&client, table).await?))
     }
     Request::Query {
@@ -465,7 +560,7 @@ async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Ou
       database,
       sql,
     } => {
-      let client = connect(&profile, password.as_deref(), &database, tunnels).await?;
+      let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
       Ok(Output::Result(run_query(&client, &sql).await?))
     }
     Request::UpdateRow {
@@ -480,6 +575,7 @@ async fn execute(request: Request, tunnels: &TunnelManager) -> anyhow::Result<Ou
         password.as_deref(),
         &source.table.database,
         tunnels,
+        cancelled,
       )
       .await?;
       update_row(&client, &source, &original, &values).await?;
@@ -637,8 +733,9 @@ async fn connect(
   password: Option<&str>,
   database: &str,
   tunnels: &TunnelManager,
+  cancelled: &Arc<AtomicBool>,
 ) -> anyhow::Result<tokio_postgres::Client> {
-  let tunnel_port = tunnels.endpoint(profile).await?;
+  let tunnel_port = tunnels.endpoint(profile, cancelled.clone()).await?;
   let mut config = Config::new();
   config
     .host(&profile.host)

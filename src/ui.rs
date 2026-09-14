@@ -287,6 +287,11 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
     };
   }
 
+  if app.busy.is_some() {
+    // Hide inactive pane actions while one database task owns the workspace.
+    return vec![("Esc", "cancel"), ("Tab", "pane"), ("^Q", "quit")];
+  }
+
   match app.focus {
     Focus::Explorer => vec![
       ("↑↓", "move"),
