@@ -23,7 +23,26 @@ Textgres is an early-stage project. It currently supports:
 - Network access to a PostgreSQL server.
 - The OpenSSH `ssh` command when SSH is enabled.
 
-## Run
+## Install
+
+Install the latest version from GitHub:
+
+```sh
+cargo install --git https://github.com/icdevin/textgres --locked
+```
+
+On Linux, this uses the system OpenSSL library. To compile and embed OpenSSL
+instead:
+
+```sh
+cargo install --git https://github.com/icdevin/textgres --locked \
+  --features vendored-openssl
+```
+
+Both commands install the `tg` executable. The vendored feature has no effect on
+macOS, where the operating system TLS framework is used.
+
+## Run from source
 
 Run from the repository:
 
@@ -37,15 +56,6 @@ Or install the executable locally:
 cargo install --path .
 tg
 ```
-
-Portable Linux release builds can embed OpenSSL:
-
-```sh
-cargo build --release --features vendored-openssl
-```
-
-Normal builds use the system OpenSSL library on Linux. macOS builds use the
-operating system TLS framework, regardless of this feature.
 
 ## Getting started
 
