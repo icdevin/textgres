@@ -10,6 +10,10 @@ license = "GPL-3.0-only"
 name = "tg"
 path = "src/main.rs"
 
+[features]
+# Portable Linux releases embed OpenSSL to avoid a runtime libssl dependency.
+vendored-openssl = ["native-tls/vendored"]
+
 [dependencies]
 anyhow = "1.0"
 directories = "6.0"

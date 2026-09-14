@@ -38,6 +38,15 @@ cargo install --path .
 tg
 ```
 
+Portable Linux release builds can embed OpenSSL:
+
+```sh
+cargo build --release --features vendored-openssl
+```
+
+Normal builds use the system OpenSSL library on Linux. macOS builds use the
+operating system TLS framework, regardless of this feature.
+
 ## Getting started
 
 1. Press `n` in the Explorer to create a connection.
