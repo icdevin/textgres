@@ -80,12 +80,16 @@ fn run(
       dirty = false;
     }
 
-    if event::poll(Duration::from_millis(50))?
-      && let Event::Key(key) = event::read()?
-      && key.kind == KeyEventKind::Press
-    {
-      app.handle_key(key);
-      dirty = true;
+    if event::poll(Duration::from_millis(50))? {
+      match event::read()? {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+          app.handle_key(key);
+          dirty = true;
+        }
+        // Ratatui updates its size on draw, even when no key follows the resize.
+        Event::Resize(_, _) => dirty = true,
+        _ => {}
+      }
     }
   }
 
