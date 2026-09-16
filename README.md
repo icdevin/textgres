@@ -160,6 +160,8 @@ only the configured identity-file path is saved.
 - Custom SQL results keep at most 500 rows.
 - Table previews keep at most 200 rows.
 - Direct table previews are editable only when the table has a primary key.
+- Saving or deleting a connection clears its table preview and row edits. Load
+  the table again after a connection change before editing rows.
 - Generated columns, views, tables without primary keys, and custom SQL results are
   read-only in the row viewer.
 - Row updates use typed parameters and match the original key and edited values.

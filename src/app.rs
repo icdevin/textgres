@@ -995,6 +995,10 @@ impl App {
       .source
       .clone()
       .ok_or_else(|| "Custom SQL results are read-only".to_owned())?;
+    // A retained row form must not dispatch an update after its preview is invalidated.
+    if self.result.source.as_ref() != Some(&source) {
+      return Err("The table preview is no longer current; reload the table before saving".into());
+    }
     if !source.columns.iter().any(|column| column.primary_key) {
       return Err("This table has no primary key; the row is read-only".into());
     }
@@ -1113,6 +1117,7 @@ impl App {
     self.profiles = profiles;
 
     // Endpoint changes invalidate every object loaded through the old profile.
+    self.invalidate_connection_preview(&id);
     self.databases.remove(&id);
     self.schemas.retain(|(profile_id, _), _| profile_id != &id);
     self
@@ -1128,6 +1133,30 @@ impl App {
     self.overlay = None;
     self.set_status("Connection saved".into(), false);
     Ok(())
+  }
+
+  // Remove editable state before the same profile ID can resolve to another endpoint.
+  fn invalidate_connection_preview(&mut self, profile_id: &str) {
+    let from_profile = |source: &Option<db::TableResultSource>| {
+      source
+        .as_ref()
+        .is_some_and(|source| source.table.profile_id == profile_id)
+    };
+    if from_profile(&self.result.source) {
+      self.result = QueryResult::default();
+      self.result_row = 0;
+      self.result_column = 0;
+    }
+    if self
+      .pending_row_edit
+      .as_ref()
+      .is_some_and(|form| from_profile(&form.source))
+    {
+      self.pending_row_edit = None;
+    }
+    if matches!(&self.overlay, Some(Overlay::RowDetail(form)) if from_profile(&form.source)) {
+      self.overlay = None;
+    }
   }
 
   fn edit_selected_connection(&mut self) {
@@ -1178,6 +1207,8 @@ impl App {
       self.set_status(format!("Could not delete connection: {error:#}"), true);
       return;
     }
+    // Deleted profiles must not leave a preview that still appears editable.
+    self.invalidate_connection_preview(profile_id);
     self.databases.remove(profile_id);
     self.schemas.retain(|(id, _), _| id != profile_id);
     self.tables.retain(|(id, _, _), _| id != profile_id);
@@ -1467,8 +1498,137 @@ mod tests {
     assert!(app.overlay.is_none());
   }
 
-  // An unpolled runtime makes worker-response ordering deterministic in UI tests.
-  fn pending_row_app() -> (tempfile::TempDir, tokio::runtime::Runtime, App) {
+  // Saving a changed endpoint must prevent the original preview from targeting that endpoint.
+  #[test]
+  fn connection_edit_invalidates_its_preview_and_rejects_old_row_forms() {
+    for active_profile in ["local", "other"] {
+      let (_directory, _runtime, mut app) = preview_app();
+      let mut other = app.profiles[0].clone();
+      other.id = "other".into();
+      app.profiles.push(other);
+      app.active_target = Some((active_profile.into(), "postgres".into()));
+      app.result.rows.push(vec![
+        Some("8".into()),
+        Some("second".into()),
+        Some("generated".into()),
+      ]);
+      app.result_row = 1;
+      app.result_column = 2;
+      let mut old_form = RowDetail::new(&app.result, 1).unwrap();
+      old_form.values[1] = Some("changed".into());
+
+      app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+      let Some(Overlay::Connection(form)) = &mut app.overlay else {
+        panic!("connection editor must open");
+      };
+      form.values[1] = "new-server".into();
+      app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+      assert_eq!(app.profile("local").unwrap().host, "new-server");
+      assert_eq!(app.storage.load_connections().unwrap(), app.profiles);
+      assert_eq!(app.result, QueryResult::default());
+      assert_eq!((app.result_row, app.result_column), (0, 0));
+      assert!(
+        app
+          .save_row(&old_form)
+          .unwrap_err()
+          .contains("reload the table")
+      );
+      assert!(app.database_task.is_none());
+      assert!(app.pending_row_edit.is_none());
+      app.focus = Focus::Results;
+      app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+      assert!(app.overlay.is_none());
+    }
+  }
+
+  // Invalidation follows preview provenance, not the selected SQL target or another profile's edits.
+  #[test]
+  fn changing_another_connection_preserves_the_current_preview() {
+    let (_directory, _runtime, mut app) = preview_app();
+    let result = app.result.clone();
+    let mut other = app.profiles[0].clone();
+    other.id = "other".into();
+    app.profiles.push(other.clone());
+    app.active_target = Some((other.id.clone(), "postgres".into()));
+    app.result_column = 2;
+    let mut connection_form = ConnectionForm::edit(&other);
+    connection_form.values[1] = "new-server".into();
+
+    app.save_connection(&connection_form).unwrap();
+    assert_eq!(app.result, result);
+    assert_eq!(app.result_column, 2);
+    app.delete_connection("other");
+    assert_eq!(app.result, result);
+    assert_eq!(app.result_column, 2);
+    let mut row_form = RowDetail::new(&app.result, 0).unwrap();
+    row_form.values[1] = Some("changed".into());
+    app.save_row(&row_form).unwrap();
+    assert!(app.database_task.is_some());
+  }
+
+  // A failed disk save leaves the old endpoint and its editable preview valid.
+  #[test]
+  fn failed_connection_save_preserves_the_profile_and_preview() {
+    let (_directory, _runtime, mut app) = preview_app();
+    app.storage.save_connections(&app.profiles).unwrap();
+    let profiles = app.profiles.clone();
+    let result = app.result.clone();
+    app.active_target = Some(("local".into(), "postgres".into()));
+    let target = app.active_target.clone();
+    let mut connection_form = ConnectionForm::edit(&app.profiles[0]);
+    connection_form.values[1] = "new-server".into();
+    // A directory at the temporary-file path forces a write failure without permission assumptions.
+    std::fs::create_dir(app.storage.root().join("connections.toml.tmp")).unwrap();
+
+    assert!(app.save_connection(&connection_form).is_err());
+    assert_eq!(app.profiles, profiles);
+    assert_eq!(app.storage.load_connections().unwrap(), profiles);
+    assert_eq!(app.result, result);
+    assert_eq!(app.active_target, target);
+    let mut row_form = RowDetail::new(&app.result, 0).unwrap();
+    row_form.values[1] = Some("changed".into());
+    app.save_row(&row_form).unwrap();
+    assert!(app.database_task.is_some());
+  }
+
+  // A deleted source must not leave editable rows or permit a retained form to dispatch a write.
+  #[test]
+  fn connection_deletion_invalidates_its_preview() {
+    let (_directory, _runtime, mut app) = preview_app();
+    let mut old_form = RowDetail::new(&app.result, 0).unwrap();
+    old_form.values[1] = Some("changed".into());
+    app.result_column = 2;
+    app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+    assert!(app.profiles.is_empty());
+    assert!(app.storage.load_connections().unwrap().is_empty());
+    assert_eq!(app.result, QueryResult::default());
+    assert_eq!((app.result_row, app.result_column), (0, 0));
+    assert!(app.overlay.is_none());
+    assert!(app.save_row(&old_form).is_err());
+    assert!(app.database_task.is_none());
+  }
+
+  // Failed deletion must preserve the preview along with the restored connection profile.
+  #[test]
+  fn failed_connection_deletion_preserves_the_preview() {
+    let (_directory, _runtime, mut app) = preview_app();
+    app.storage.save_connections(&app.profiles).unwrap();
+    let profiles = app.profiles.clone();
+    let result = app.result.clone();
+    std::fs::create_dir(app.storage.root().join("connections.toml.tmp")).unwrap();
+
+    app.delete_connection("local");
+    assert!(app.status_is_error);
+    assert_eq!(app.profiles, profiles);
+    assert_eq!(app.storage.load_connections().unwrap(), profiles);
+    assert_eq!(app.result, result);
+  }
+
+  // An unpolled runtime keeps profile and preview tests independent of network access.
+  fn preview_app() -> (tempfile::TempDir, tokio::runtime::Runtime, App) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path().to_owned()).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1494,6 +1654,12 @@ mod tests {
       sender,
     );
     app.result = editable_result();
+    (directory, runtime, app)
+  }
+
+  // Reuse a valid preview so cancellation tests start with a dispatched row edit.
+  fn pending_row_app() -> (tempfile::TempDir, tokio::runtime::Runtime, App) {
+    let (directory, runtime, mut app) = preview_app();
     let mut form = RowDetail::new(&app.result, 0).unwrap();
     form.values[1] = Some("changed".into());
     app.save_row(&form).unwrap();
