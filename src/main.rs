@@ -33,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
   let mut app = App::new(storage, profiles, scripts, runtime, database_tx);
 
   let _keyboard_enhancement = KeyboardEnhancementGuard::enable();
-  ratatui::run(|terminal| run(terminal, &mut app, database_rx))?;
+  let result = ratatui::run(|terminal| run(terminal, &mut app, database_rx));
+  // Restore the terminal first, then let pending SQL reach a known cancellation outcome.
+  let shutdown_result = app.shutdown().await;
+  result?;
+  shutdown_result?;
   Ok(())
 }
 

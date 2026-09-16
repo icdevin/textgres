@@ -167,6 +167,20 @@ only the configured identity-file path is saved.
   overwritten.
 - Custom SQL is unrestricted and can modify or delete data.
 
+Press `Esc` to request cancellation. Textgres displays `Cancelling…` and waits
+for the query outcome. If the query finishes first, its success is retained.
+If cancellation cannot be confirmed within five seconds, Textgres closes the
+connection and reports that the write outcome is unknown. Check the data before
+retrying a write with an unknown outcome.
+
+Cancellation does not undo earlier committed statements. If a row update has
+already committed and only its preview refresh is cancelled, Textgres reports
+`Row saved; refresh cancelled`. Normal exit also requests cancellation and waits
+for the worker to finish.
+
+The 500-row limit bounds displayed data. Textgres continues reading the response
+to receive later errors and determine whether the query completed.
+
 ## SSH troubleshooting
 
 If an SSH connection fails:
@@ -186,5 +200,16 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
+
+Database regression tests create disposable local PostgreSQL clusters. Install
+`initdb`, `pg_ctl`, and `postgres` on `PATH`, then run these tests as a non-root
+user. The TLS test also requires the `openssl` command:
+
+```sh
+cargo test postgres_ -- --ignored --test-threads=1
+```
+
+These tests use temporary directories and local ports. They do not connect to
+saved profiles or existing databases.
 
 Textgres is licensed under [GPL-3.0-only](LICENSE).

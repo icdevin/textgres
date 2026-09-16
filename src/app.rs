@@ -507,7 +507,7 @@ impl App {
       .as_ref()
       .is_none_or(|task| task.operation_id() != response.operation_id)
     {
-      // A cancelled task can have queued its response before Escape was handled.
+      // Ignore stale responses without discarding the active worker's actual outcome.
       return;
     }
     self.database_task = None;
@@ -546,19 +546,39 @@ impl App {
         self.set_status(status, false);
       }
       Ok(Output::Updated(result)) => {
-        let status = format!("Row updated; {}", result.status);
         self.pending_row_edit = None;
-        self.result = result;
         self.result_row = 0;
         self.result_column = 0;
         self.focus = Focus::Results;
-        self.set_status(status, false);
+        match result {
+          Ok(result) => {
+            let status = format!("Row saved; {}", result.status);
+            self.result = result;
+            self.set_status(status, false);
+          }
+          Err(error) => {
+            // Old row values must not remain editable after a committed write.
+            self.result = QueryResult::default();
+            if error.is::<db::Cancelled>() {
+              self.set_status("Row saved; refresh cancelled".into(), false);
+            } else {
+              self.set_status(
+                format!("Row saved; refresh failed: {}", db::format_error(&error)),
+                true,
+              );
+            }
+          }
+        }
       }
       Err(error) => {
         if let Some(form) = self.pending_row_edit.take() {
           self.overlay = Some(Overlay::RowDetail(Box::new(form)));
         }
-        self.set_status(db::format_error(&error), true);
+        if error.is::<db::Cancelled>() {
+          self.set_status(error.to_string(), false);
+        } else {
+          self.set_status(db::format_error(&error), true);
+        }
       }
     }
   }
@@ -1020,19 +1040,20 @@ impl App {
   }
 
   fn cancel_database_operation(&mut self) {
-    let Some(task) = self.database_task.take() else {
+    let Some(task) = self.database_task.as_ref() else {
       return;
     };
-    let description = self
-      .busy
-      .take()
-      .unwrap_or_else(|| "database operation".into());
+    // Keep the operation and pending edits until the worker confirms its outcome.
     task.cancel();
-    if let Some(form) = self.pending_row_edit.take() {
-      // Preserve unsaved edits when a row update is cancelled.
-      self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+    self.set_status("Cancelling…".into(), false);
+  }
+
+  // Normal exit must wait for server cancellation before the runtime shuts down.
+  pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+    if let Some(task) = self.database_task.take() {
+      task.shutdown().await?;
     }
-    self.set_status(format!("Cancelled: {description}"), false);
+    Ok(())
   }
 
   fn save_connection(&mut self, form: &ConnectionForm) -> Result<(), String> {
@@ -1336,9 +1357,9 @@ mod tests {
     )));
   }
 
-  // Escape must cancel immediately and reject a response queued by the old task.
+  // Escape requests cancellation but must still accept a success queued before it.
   #[test]
-  fn escape_cancels_the_active_database_operation() {
+  fn escape_waits_for_the_actual_database_outcome() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Storage::new(directory.path().to_owned()).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1374,18 +1395,109 @@ mod tests {
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert!(app.busy.is_none());
-    assert!(app.database_task.is_none());
-    assert_eq!(app.status, "Cancelled: Connecting to Local");
+    assert!(app.busy.is_some());
+    assert!(app.database_task.is_some());
+    assert_eq!(app.status, "Cancelling…");
+    app.handle_database_response(Response {
+      operation_id: operation_id + 1,
+      result: Err(db::Cancelled.into()),
+    });
+    assert!(app.busy.is_some());
     app.handle_database_response(Response {
       operation_id,
       result: Ok(Output::Databases {
         profile_id: "local".into(),
-        names: vec!["must_be_ignored".into()],
+        names: vec!["completed_before_cancel".into()],
       }),
     });
-    assert!(!app.databases.contains_key("local"));
-    assert_eq!(app.status, "Cancelled: Connecting to Local");
+    assert_eq!(app.databases["local"], vec!["completed_before_cancel"]);
+    assert!(app.busy.is_none());
+    assert!(app.database_task.is_none());
+    assert_eq!(app.status, "Loaded 1 database(s)");
+  }
+
+  // Unsaved values remain recoverable only after the worker confirms cancellation.
+  #[test]
+  fn confirmed_cancellation_restores_pending_row_edits() {
+    let (_directory, _runtime, mut app) = pending_row_app();
+    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.overlay.is_none());
+    assert!(app.pending_row_edit.is_some());
+    app.handle_database_response(Response {
+      operation_id,
+      result: Err(db::Cancelled.into()),
+    });
+    let Some(Overlay::RowDetail(form)) = &app.overlay else {
+      panic!("cancelled edit must be restored");
+    };
+    assert_eq!(form.values[1].as_deref(), Some("changed"));
+    assert!(!app.status_is_error);
+    assert!(app.busy.is_none());
+  }
+
+  // A saved row must not be offered for retry when only its preview was cancelled.
+  #[test]
+  fn cancelled_refresh_preserves_the_committed_write_outcome() {
+    let (_directory, _runtime, mut app) = pending_row_app();
+    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    app.handle_database_response(Response {
+      operation_id,
+      result: Ok(Output::Updated(Err(db::Cancelled.into()))),
+    });
+    assert_eq!(app.status, "Row saved; refresh cancelled");
+    assert!(app.pending_row_edit.is_none());
+    assert!(app.overlay.is_none());
+    assert!(app.result.source.is_none());
+    assert!(app.result.rows.is_empty());
+  }
+
+  // Server and connection failures during refresh have the same committed-write boundary.
+  #[test]
+  fn failed_refresh_does_not_restore_an_already_saved_edit() {
+    let (_directory, _runtime, mut app) = pending_row_app();
+    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    app.handle_database_response(Response {
+      operation_id,
+      result: Ok(Output::Updated(Err(anyhow::anyhow!("connection closed")))),
+    });
+    assert!(app.status.starts_with("Row saved; refresh failed:"));
+    assert!(app.status_is_error);
+    assert!(app.pending_row_edit.is_none());
+    assert!(app.overlay.is_none());
+  }
+
+  // An unpolled runtime makes worker-response ordering deterministic in UI tests.
+  fn pending_row_app() -> (tempfile::TempDir, tokio::runtime::Runtime, App) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = std::sync::mpsc::channel();
+    let profile = ConnectionProfile {
+      id: "local".into(),
+      name: "Local".into(),
+      host: "192.0.2.1".into(),
+      port: 5432,
+      database: "postgres".into(),
+      user: "postgres".into(),
+      password: None,
+      require_tls: false,
+      ssh: None,
+    };
+    let mut app = App::new(
+      storage,
+      vec![profile],
+      vec![],
+      runtime.handle().clone(),
+      sender,
+    );
+    app.result = editable_result();
+    let mut form = RowDetail::new(&app.result, 0).unwrap();
+    form.values[1] = Some("changed".into());
+    app.save_row(&form).unwrap();
+    (directory, runtime, app)
   }
 
   #[test]

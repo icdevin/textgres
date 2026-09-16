@@ -1,5 +1,7 @@
 use std::{
   collections::HashMap,
+  fmt,
+  future::Future,
   io::{self, Read},
   net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
   process::{Child, Command, Stdio},
@@ -16,7 +18,7 @@ use anyhow::Context;
 use futures_util::StreamExt;
 use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::Notify, task::JoinHandle};
 use tokio_postgres::{
   Config, SimpleQueryMessage,
   config::SslMode,
@@ -27,6 +29,8 @@ use tokio_postgres::{
 use crate::storage::{ConnectionProfile, SshConfig};
 
 const MAX_RESULT_ROWS: usize = 500;
+// A lost cancellation connection must not leave the terminal busy indefinitely.
+const CANCELLATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A table node carries enough context to reconnect and preview it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,21 +125,55 @@ pub enum Output {
     tables: Vec<TableRef>,
   },
   Result(QueryResult),
-  Updated(QueryResult),
+  // The write is committed even when its separate preview refresh fails.
+  Updated(anyhow::Result<QueryResult>),
 }
 
-/// An operation ID lets the UI reject output that was queued before cancellation.
+/// An operation ID keeps responses associated with the worker that owns them.
 #[derive(Debug)]
 pub struct Response {
   pub operation_id: u64,
   pub result: anyhow::Result<Output>,
 }
 
-/// A task handle cancels async I/O and signals blocking SSH setup on drop.
+// Distinguish confirmed cancellation from an unknown write outcome.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl fmt::Display for Cancelled {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("Database operation cancelled")
+  }
+}
+
+impl std::error::Error for Cancelled {}
+
+// The flag also reaches blocking SSH setup; Notify wakes the async worker promptly.
+#[derive(Default)]
+struct Cancellation {
+  requested: Arc<AtomicBool>,
+  notification: Notify,
+}
+
+impl Cancellation {
+  fn request(&self) {
+    self.requested.store(true, Ordering::SeqCst);
+    self.notification.notify_one();
+  }
+
+  // The stored notification permit closes the race between checking and waiting.
+  async fn wait(&self) {
+    if !self.requested.load(Ordering::SeqCst) {
+      self.notification.notified().await;
+    }
+  }
+}
+
+/// The worker retains ownership until PostgreSQL reports the operation's outcome.
 pub struct Task {
   operation_id: u64,
-  cancelled: Arc<AtomicBool>,
-  abort_handle: tokio::task::AbortHandle,
+  cancellation: Arc<Cancellation>,
+  worker: JoinHandle<anyhow::Result<()>>,
 }
 
 impl Task {
@@ -144,16 +182,96 @@ impl Task {
   }
 
   pub fn cancel(&self) {
-    // spawn_blocking cannot be aborted, so it must also observe this flag.
-    self.cancelled.store(true, Ordering::SeqCst);
-    self.abort_handle.abort();
+    // Aborting the request future would leave PostgreSQL free to commit its work.
+    self.cancellation.request();
+  }
+
+  pub async fn shutdown(mut self) -> anyhow::Result<()> {
+    // Keep the runtime alive long enough to deliver cancellation on normal exit.
+    self.cancel();
+    (&mut self.worker)
+      .await
+      .context("database worker stopped unexpectedly")?
   }
 }
 
 impl Drop for Task {
   fn drop(&mut self) {
-    // App shutdown must not leave an in-progress database task detached.
+    // Dropping the UI handle still gives the bounded worker a chance to cancel.
     self.cancel();
+  }
+}
+
+// Own the protocol driver so no database connection outlives its operation.
+struct DatabaseConnection {
+  client: tokio_postgres::Client,
+  driver: JoinHandle<()>,
+  tls: MakeTlsConnector,
+  cancellation: Arc<Cancellation>,
+}
+
+impl Drop for DatabaseConnection {
+  fn drop(&mut self) {
+    self.driver.abort();
+  }
+}
+
+impl DatabaseConnection {
+  // Supervise each statement separately so cancellation cannot start a later phase.
+  async fn run<T>(
+    &self,
+    work: impl Future<Output = Result<T, tokio_postgres::Error>>,
+  ) -> anyhow::Result<T> {
+    ensure_not_cancelled(&self.cancellation.requested)?;
+    tokio::pin!(work);
+    let result = tokio::select! {
+      biased;
+      result = &mut work => result,
+      () = self.cancellation.wait() => {
+        let token = self.client.cancel_token();
+        let mut cancel_error = None;
+        // The original response, not successful delivery of CancelRequest, is authoritative.
+        let completion = async {
+          tokio::select! {
+            biased;
+            result = &mut work => result,
+            sent = token.cancel_query(self.tls.clone()) => {
+              cancel_error = sent.err();
+              work.await
+            }
+          }
+        };
+        match tokio::time::timeout(CANCELLATION_TIMEOUT, completion).await {
+          Ok(result) => result,
+          Err(_) => {
+            let detail = cancel_error.map_or_else(String::new, |error| format!("; cancel request failed: {error}"));
+            anyhow::bail!("Cancellation was not confirmed within 5 seconds; write outcome is unknown{detail}");
+          }
+        }
+      }
+    };
+    match result {
+      Err(error)
+        if self.cancellation.requested.load(Ordering::SeqCst)
+          && error.code() == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) =>
+      {
+        Err(Cancelled.into())
+      }
+      Err(error) => {
+        let Some(database_error) = error.as_db_error() else {
+          return Err(error).context("Database connection failed; write outcome is unknown");
+        };
+        if matches!(database_error.severity(), "FATAL" | "PANIC") {
+          // A server disconnect can arrive after a commit but before its acknowledgement.
+          anyhow::bail!(
+            "Database connection failed; write outcome is unknown: {}",
+            format_database_error(database_error)
+          );
+        }
+        Err(error.into())
+      }
+      Ok(value) => Ok(value),
+    }
   }
 }
 
@@ -302,10 +420,9 @@ impl SshTunnelProcess {
 }
 
 fn ensure_not_cancelled(cancelled: &AtomicBool) -> anyhow::Result<()> {
-  anyhow::ensure!(
-    !cancelled.load(Ordering::SeqCst),
-    "database operation was cancelled"
-  );
+  if cancelled.load(Ordering::SeqCst) {
+    return Err(Cancelled.into());
+  }
   Ok(())
 }
 
@@ -433,30 +550,33 @@ pub fn spawn(
   operation_id: u64,
   request: Request,
 ) -> Task {
-  let cancelled = Arc::new(AtomicBool::new(false));
-  let worker_cancelled = cancelled.clone();
-  let join_handle = runtime.spawn(async move {
-    let result = execute(request, &tunnels, &worker_cancelled).await;
-    if worker_cancelled.load(Ordering::SeqCst) {
-      return;
-    }
+  let cancellation = Arc::new(Cancellation::default());
+  let worker_cancellation = cancellation.clone();
+  let worker = runtime.spawn(async move {
+    let result = execute(request, &tunnels, &worker_cancellation).await;
+    // The terminal receiver closes on exit; still report an uncertain write to the caller.
+    let shutdown_result = match &result {
+      Err(error) if !error.is::<Cancelled>() => Err(anyhow::anyhow!(format_error(error))),
+      _ => Ok(()),
+    };
     // The receiver can disappear during normal application shutdown.
     let _ = sender.send(Response {
       operation_id,
       result,
     });
+    shutdown_result
   });
   Task {
     operation_id,
-    cancelled,
-    abort_handle: join_handle.abort_handle(),
+    cancellation,
+    worker,
   }
 }
 
 async fn execute(
   request: Request,
   tunnels: &TunnelManager,
-  cancelled: &Arc<AtomicBool>,
+  cancelled: &Arc<Cancellation>,
 ) -> anyhow::Result<Output> {
   match request {
     Request::Databases { profile, password } => {
@@ -470,11 +590,11 @@ async fn execute(
       )
       .await?;
       let rows = client
-        .query(
+        .run(client.client.query(
           "SELECT datname FROM pg_database \
                      WHERE datallowconn AND NOT datistemplate ORDER BY datname",
           &[],
-        )
+        ))
         .await?;
       Ok(Output::Databases {
         profile_id,
@@ -489,12 +609,12 @@ async fn execute(
       let profile_id = profile.id.clone();
       let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
       let rows = client
-        .query(
+        .run(client.client.query(
           "SELECT nspname FROM pg_namespace \
                      WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
                      AND nspname NOT LIKE 'pg_toast%' ORDER BY nspname",
           &[],
-        )
+        ))
         .await?;
       Ok(Output::Schemas {
         profile_id,
@@ -511,7 +631,7 @@ async fn execute(
       let profile_id = profile.id.clone();
       let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
       let rows = client
-        .query(
+        .run(client.client.query(
           "SELECT c.relname, CASE c.relkind \
                          WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' \
                          WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
@@ -520,7 +640,7 @@ async fn execute(
                      WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
                      ORDER BY c.relname",
           &[&schema],
-        )
+        ))
         .await?;
       let tables = rows
         .into_iter()
@@ -579,13 +699,13 @@ async fn execute(
       )
       .await?;
       update_row(&client, &source, &original, &values).await?;
-      Ok(Output::Updated(preview_table(&client, source.table).await?))
+      Ok(Output::Updated(preview_table(&client, source.table).await))
     }
   }
 }
 
 async fn preview_table(
-  client: &tokio_postgres::Client,
+  client: &DatabaseConnection,
   table: TableRef,
 ) -> anyhow::Result<QueryResult> {
   let columns = table_columns(client, &table).await?;
@@ -607,11 +727,11 @@ async fn preview_table(
 }
 
 async fn table_columns(
-  client: &tokio_postgres::Client,
+  client: &DatabaseConnection,
   table: &TableRef,
 ) -> anyhow::Result<Vec<ResultColumn>> {
   let rows = client
-    .query(
+    .run(client.client.query(
       "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
               a.attgenerated = '', \
               EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid \
@@ -622,7 +742,7 @@ async fn table_columns(
         WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
         ORDER BY a.attnum",
       &[&table.schema, &table.name],
-    )
+    ))
     .await?;
   let table_is_editable = matches!(table.kind.as_str(), "table" | "partitioned table");
   Ok(
@@ -639,7 +759,7 @@ async fn table_columns(
 }
 
 async fn update_row(
-  client: &tokio_postgres::Client,
+  client: &DatabaseConnection,
   source: &TableResultSource,
   original: &[Option<String>],
   values: &[Option<String>],
@@ -650,9 +770,11 @@ async fn update_row(
     .map(|value| value as &(dyn ToSql + Sync))
     .collect::<Vec<_>>();
   client
-    .batch_execute("SET statement_timeout = '30s'")
+    .run(client.client.batch_execute("SET statement_timeout = '30s'"))
     .await?;
-  let affected = client.execute(&sql, &parameter_refs).await?;
+  let affected = client
+    .run(client.client.execute(&sql, &parameter_refs))
+    .await?;
   anyhow::ensure!(
     affected == 1,
     "row update conflict: expected one matching row, found {affected}"
@@ -733,9 +855,27 @@ async fn connect(
   password: Option<&str>,
   database: &str,
   tunnels: &TunnelManager,
-  cancelled: &Arc<AtomicBool>,
-) -> anyhow::Result<tokio_postgres::Client> {
-  let tunnel_port = tunnels.endpoint(profile, cancelled.clone()).await?;
+  cancelled: &Arc<Cancellation>,
+) -> anyhow::Result<DatabaseConnection> {
+  // No SQL has started during setup, so dropping this future is safe.
+  tokio::select! {
+    biased;
+    () = cancelled.wait() => Err(Cancelled.into()),
+    result = connect_inner(profile, password, database, tunnels, cancelled) => result,
+  }
+}
+
+// Keep connection setup separate from the lifetime of an executing statement.
+async fn connect_inner(
+  profile: &ConnectionProfile,
+  password: Option<&str>,
+  database: &str,
+  tunnels: &TunnelManager,
+  cancelled: &Arc<Cancellation>,
+) -> anyhow::Result<DatabaseConnection> {
+  let tunnel_port = tunnels
+    .endpoint(profile, cancelled.requested.clone())
+    .await?;
   let mut config = Config::new();
   config
     .host(&profile.host)
@@ -765,64 +905,74 @@ async fn connect(
 
   // Native roots verify remote PostgreSQL certificates when TLS is required.
   let tls = MakeTlsConnector::new(TlsConnector::builder().build()?);
-  let (client, connection) = config.connect(tls).await?;
-  tokio::spawn(async move {
+  let (client, connection) = config.connect(tls.clone()).await?;
+  let driver = tokio::spawn(async move {
     // Query futures receive connection failures; no terminal output is safe here.
     let _ = connection.await;
   });
-  Ok(client)
+  Ok(DatabaseConnection {
+    client,
+    driver,
+    tls,
+    cancellation: cancelled.clone(),
+  })
 }
 
-async fn run_query(client: &tokio_postgres::Client, sql: &str) -> anyhow::Result<QueryResult> {
+async fn run_query(client: &DatabaseConnection, sql: &str) -> anyhow::Result<QueryResult> {
   client
-    .batch_execute("SET statement_timeout = '30s'")
+    .run(client.client.batch_execute("SET statement_timeout = '30s'"))
     .await?;
-  let stream = client.simple_query_raw(sql).await?;
-  futures_util::pin_mut!(stream);
+  // Keep reading through ReadyForQuery so late errors and cancellation are observed.
+  client
+    .run(async {
+      let stream = client.client.simple_query_raw(sql).await?;
+      futures_util::pin_mut!(stream);
 
-  let mut result = QueryResult::default();
-  let mut affected = Vec::new();
-  while let Some(message) = stream.next().await {
-    match message? {
-      SimpleQueryMessage::RowDescription(columns) => {
-        // The last result set is the least surprising view for multi-statement SQL.
-        result.columns = columns
-          .iter()
-          .map(|column| column.name().to_owned())
-          .collect();
-        result.rows.clear();
-        result.truncated = false;
-      }
-      SimpleQueryMessage::Row(row) => {
-        if result.rows.len() == MAX_RESULT_ROWS {
-          result.truncated = true;
-          break;
+      let mut result = QueryResult::default();
+      let mut affected = Vec::new();
+      while let Some(message) = stream.next().await {
+        match message? {
+          SimpleQueryMessage::RowDescription(columns) => {
+            // The last result set is the least surprising view for multi-statement SQL.
+            result.columns = columns
+              .iter()
+              .map(|column| column.name().to_owned())
+              .collect();
+            result.rows.clear();
+            result.truncated = false;
+          }
+          SimpleQueryMessage::Row(row) => {
+            if result.rows.len() == MAX_RESULT_ROWS {
+              result.truncated = true;
+              continue;
+            }
+            result.rows.push(
+              (0..row.len())
+                // Preserve nullability so the renderer never confuses NULL with text.
+                .map(|index| row.get(index).map(str::to_owned))
+                .collect(),
+            );
+          }
+          SimpleQueryMessage::CommandComplete(count) => affected.push(count),
+          _ => {}
         }
-        result.rows.push(
-          (0..row.len())
-            // Preserve nullability so the renderer never confuses NULL with text.
-            .map(|index| row.get(index).map(str::to_owned))
-            .collect(),
-        );
       }
-      SimpleQueryMessage::CommandComplete(count) => affected.push(count),
-      _ => {}
-    }
-  }
 
-  result.status = if result.truncated {
-    format!("Showing first {MAX_RESULT_ROWS} rows; result truncated")
-  } else if !result.columns.is_empty() {
-    format!("{} row(s)", result.rows.len())
-  } else if affected.is_empty() {
-    "Query completed".to_owned()
-  } else {
-    format!(
-      "Query completed; {} row(s) affected",
-      affected.iter().sum::<u64>()
-    )
-  };
-  Ok(result)
+      result.status = if result.truncated {
+        format!("Showing first {MAX_RESULT_ROWS} rows; result truncated")
+      } else if !result.columns.is_empty() {
+        format!("{} row(s)", result.rows.len())
+      } else if affected.is_empty() {
+        "Query completed".to_owned()
+      } else {
+        format!(
+          "Query completed; {} row(s) affected",
+          affected.iter().sum::<u64>()
+        )
+      };
+      Ok(result)
+    })
+    .await
 }
 
 // PostgreSQL identifiers cannot use value parameters, so quote them as identifiers.
@@ -936,3 +1086,7 @@ mod tests {
     assert_eq!(arguments.last().unwrap(), "gateway.example.com");
   }
 }
+
+// Real-server regression tests remain separate from SQL-construction unit tests.
+#[cfg(test)]
+mod integration_tests;

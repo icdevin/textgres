@@ -23,7 +23,7 @@ postgres-native-tls = "0.5"
 ratatui = "0.30"
 ratatui-textarea = "0.9"
 serde = { version = "1.0", features = ["derive"] }
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = "0.7.18"
 toml = "0.9"
 tree-sitter-highlight = "0.25"
