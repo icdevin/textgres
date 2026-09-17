@@ -136,6 +136,8 @@ impl SessionManager {
   ) -> (anyhow::Result<Output>, Option<SessionState>) {
     // Table cursors have their own connections and never borrow the SQL session transaction.
     match &request {
+      // Disconnect releases idle preview cursors too; already loaded rows stay in the UI.
+      Request::Disconnect { profile, database } => self.previews.remove(&profile.id, database),
       Request::Preview {
         profile,
         password,

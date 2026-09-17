@@ -91,12 +91,24 @@ executions. Different workspaces can run operations concurrently. Each workspace
 allows one operation at a time; `Esc` cancels only that workspace's operation.
 
 - `F6`: Connect. An existing connection is kept.
-- `F7`: Disconnect the selected SQL session; keep its editor and results.
+- `c` in the Explorer: Connect or disconnect the selected connection or database.
+  The shortcut bar shows the available action. Connecting selects its SQL workspace.
+- `F7`: Disconnect the active SQL session outside the Explorer. Keep SQL text,
+  loaded rows, and staged edits.
 - `F8`: Reconnect with a new connection. Temporary tables and session settings
   are lost.
 
+On an Explorer connection row, `c` connects its default database when disconnected,
+or closes all database sessions for that profile when any are connected.
+On a database, schema, or table row, it toggles only that database. Disconnecting
+keeps the active workspace selected. Finish or cancel operations on the selected targets
+first. If any target has an open, failed, or unknown transaction, one confirmation
+appears before any session closes. Disconnect also closes those targets' preview
+cursors; loaded rows remain, but further paging requires a fresh preview or query.
+
 After a disconnect or connection failure, SQL execution does not reconnect
-automatically, including when expanding the Explorer again. Use `F6` or `F8`.
+automatically, including when expanding the Explorer again. Use `c` in the Explorer,
+or `F6` / `F8` for the active SQL session.
 Failed connection attempts also require an explicit retry. A lost connection cannot restore an uncommitted transaction.
 After an uncertain write outcome, check the data before retrying.
 
@@ -225,13 +237,15 @@ The bottom bar shows controls for the active pane or dialog. `^` means `Ctrl`.
 | Global | `Tab` / `Shift+Tab` | Select the next or previous pane |
 | Global | `Ctrl+Q` | Quit |
 | Global | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous or next visited workspace |
-| Global | `F6` / `F7` / `F8` | Connect / disconnect / reconnect selected SQL session |
+| Global | `F6` / `F8` | Connect / reconnect active SQL session |
+| SQL / Results | `F7` | Disconnect active SQL session |
 | Database operation | `Esc` | Cancel the current database operation |
 | Explorer | `↑` / `↓`, `j` / `k` | Move selection |
 | Explorer | `Home` / `End`, `g` / `G` | Select the first or last item |
 | Explorer | `Enter`, `Space`, `→` | Expand or activate |
 | Explorer | `←` | Collapse |
 | Explorer | `n` / `e` / `d` | New, edit, or delete a connection |
+| Explorer | `c` | Connect / disconnect selected connection or database |
 | Explorer | `Ctrl+Left` / `Ctrl+Right` | Resize the Explorer |
 | SQL | `F5` or `Ctrl+Enter` | Run SQL |
 | SQL | `Ctrl+S` | Save the editor contents as a script |

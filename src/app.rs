@@ -23,6 +23,8 @@ mod sessions;
 mod workspace;
 // Local table drafts and explicit batch actions do not own SQL sessions.
 mod table_edits;
+// Explorer lifecycle actions resolve the selected node without changing the active workspace.
+mod explorer_sessions;
 pub use sessions::SessionAction;
 pub use workspace::Workspace;
 
@@ -341,12 +343,24 @@ impl RowDetail {
 #[derive(Clone, Debug)]
 pub enum Overlay {
   Connection(Box<ConnectionForm>),
-  SaveScript { name: String, cursor: usize },
-  LoadScript { selected: usize },
+  SaveScript {
+    name: String,
+    cursor: usize,
+  },
+  LoadScript {
+    selected: usize,
+  },
   RowDetail(Box<RowDetail>),
   ConfirmSession(SessionAction),
+  ConfirmExplorerDisconnect {
+    targets: Vec<(String, String)>,
+    label: String,
+  },
   ConfirmRefresh,
-  ConfirmDelete { profile_id: String, name: String },
+  ConfirmDelete {
+    profile_id: String,
+    name: String,
+  },
 }
 
 /// Central application state; database work is sent to independent Tokio tasks.
@@ -497,7 +511,11 @@ impl App {
         return;
       }
       KeyCode::F(7) => {
-        self.request_session_action(SessionAction::Disconnect);
+        if self.workspace.focus == Focus::Explorer {
+          self.disconnect_selected(false, None);
+        } else {
+          self.request_session_action(SessionAction::Disconnect);
+        }
         return;
       }
       KeyCode::F(8) => {
@@ -569,6 +587,8 @@ impl App {
       }
       KeyCode::Char('e') => self.edit_selected_connection(),
       KeyCode::Char('d') => self.confirm_delete_selected_connection(),
+      // Modified keys such as Ctrl+C must not toggle a connection.
+      KeyCode::Char('c') if key.modifiers.is_empty() => self.toggle_selected_connection(),
       _ => {}
     }
   }
@@ -834,6 +854,11 @@ impl App {
         KeyCode::Char('n') | KeyCode::Esc => {}
         _ => self.workspace.overlay = Some(overlay),
       },
+      Overlay::ConfirmExplorerDisconnect { targets, .. } => match key.code {
+        KeyCode::Char('y') => self.disconnect_selected(true, Some(targets.clone())),
+        KeyCode::Char('n') | KeyCode::Esc => {}
+        _ => self.workspace.overlay = Some(overlay),
+      },
       Overlay::ConfirmDelete { profile_id, .. } => match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
           self.delete_connection(profile_id);
@@ -1048,18 +1073,23 @@ impl App {
     ) {
       self.workspace.result.page = None;
     }
-    let operation_id = self.next_operation_id;
-    self.next_operation_id = self.next_operation_id.wrapping_add(1);
     self.workspace.busy = Some(description.clone());
     self.set_status(description, false);
-    self.workspace.database_task = Some(db::spawn(
+    self.workspace.database_task = Some(self.start_database_task(request));
+  }
+
+  // All workspaces share one operation-ID sequence, including background disconnects.
+  fn start_database_task(&mut self, request: Request) -> db::Task {
+    let operation_id = self.next_operation_id;
+    self.next_operation_id = self.next_operation_id.wrapping_add(1);
+    db::spawn(
       &self.runtime,
       self.database_tx.clone(),
       self.tunnels.clone(),
       self.sessions.clone(),
       operation_id,
       request,
-    ));
+    )
   }
 
   fn cancel_database_operation(&mut self) {
@@ -1362,6 +1392,8 @@ mod tests {
   mod table_edits;
   // Result continuation regressions use the shared workspace fixtures.
   mod paging;
+  // Explorer disconnect regressions share the workspace fixtures.
+  mod explorer_sessions;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 

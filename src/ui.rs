@@ -395,7 +395,9 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
         vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
       }
       Overlay::ConfirmRefresh => vec![("Y", "discard and refresh"), ("N/Esc", "cancel")],
-      Overlay::ConfirmSession(_) => vec![("Y", "confirm"), ("N/Esc", "cancel")],
+      Overlay::ConfirmSession(_) | Overlay::ConfirmExplorerDisconnect { .. } => {
+        vec![("Y", "confirm"), ("N/Esc", "cancel")]
+      }
     };
   }
 
@@ -417,6 +419,14 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("n", "new"),
       ("e", "edit"),
       ("d", "delete"),
+      (
+        "c",
+        if app.selected_connection_is_connected() {
+          "disconnect"
+        } else {
+          "connect"
+        },
+      ),
       ("^←/^→", "width"),
       ("Tab", "pane"),
       ("^Q", "quit"),
@@ -601,6 +611,16 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
       let area = centered(frame.area(), 70, 7);
       frame.render_widget(Clear, area);
       frame.render_widget(Paragraph::new("Discard pending table changes and refresh from the database? If the last save outcome was unknown, verify the refreshed data before editing. Y: refresh · N/Esc: keep changes").wrap(Wrap { trim: false }).block(pane_block(" Refresh table? ", true).padding(Padding::uniform(1))), area);
+    }
+    Overlay::ConfirmExplorerDisconnect { label, .. } => {
+      let area = centered(frame.area(), 70, 8);
+      frame.render_widget(Clear, area);
+      frame.render_widget(
+        Paragraph::new(format!("Disconnect {label}? Open transactions will be rolled back; temporary tables and session settings will be lost. Y: disconnect · N/Esc: cancel"))
+          .wrap(Wrap { trim: true })
+          .block(pane_block(" Disconnect ", true)),
+        area,
+      );
     }
     Overlay::ConfirmSession(action) => {
       // Require an explicit Y so Enter cannot accidentally discard a transaction.
@@ -951,6 +971,13 @@ mod tests {
     assert!(screen.contains("dev@example.com"));
     assert!(screen.contains("NULL"));
     assert!(screen.contains("^←/^→ width"));
+    assert!(screen.contains("c disconnect"));
+    // The action follows the selected node's connection state, not a static disconnect label.
+    app.workspace.session_state = crate::db::SessionState::Disconnected;
+    assert!(shortcuts(&app).contains(&("c", "connect")));
+    assert!(!shortcuts(&app).contains(&("c", "disconnect")));
+    app.workspace.session_state =
+      crate::db::SessionState::Connected(crate::db::TransactionState::Idle);
     let cells = terminal.backend().buffer().content();
     assert!(cells.iter().any(|cell| {
       cell.symbol() == "L" && cell.fg == THEME.cyan && cell.modifier.contains(Modifier::BOLD)

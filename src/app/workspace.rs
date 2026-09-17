@@ -57,11 +57,10 @@ impl Workspace {
     let fetched_page = std::mem::take(&mut self.fetching_page);
     if let Some(state) = response.session_state {
       self.session_state = state;
-      // Closing a SQL connection also closes its result cursor; independent table previews survive.
-      if matches!(
-        state,
-        db::SessionState::Disconnected | db::SessionState::Lost
-      ) && self.result.page.as_ref().is_some_and(|page| !page.preview)
+      // Explicit disconnect closes all cursors; SQL loss alone leaves independent previews intact.
+      if state == db::SessionState::Disconnected
+        || (state == db::SessionState::Lost
+          && self.result.page.as_ref().is_some_and(|page| !page.preview))
       {
         self.result.page = None;
       }

@@ -636,3 +636,6 @@ mod changes;
 
 // Cursor tests verify bounded fetching and retained transaction ownership.
 mod paging;
+
+// Explorer disconnect tests drive actual key handling and PostgreSQL connection lifetimes.
+mod explorer_sessions;
