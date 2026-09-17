@@ -18,6 +18,12 @@ use crate::{
   theme::THEME,
 };
 
+// Session workspaces and lifecycle actions are separate from pane input handling.
+mod sessions;
+mod workspace;
+pub use sessions::SessionAction;
+pub use workspace::Workspace;
+
 const MIN_EXPLORER_WIDTH_PERCENT: u16 = 15;
 const MAX_EXPLORER_WIDTH_PERCENT: u16 = 50;
 const EXPLORER_RESIZE_STEP_PERCENT: i16 = 2;
@@ -318,13 +324,13 @@ pub enum Overlay {
   SaveScript { name: String, cursor: usize },
   LoadScript { selected: usize },
   RowDetail(Box<RowDetail>),
+  ConfirmSession(SessionAction),
   ConfirmDelete { profile_id: String, name: String },
 }
 
 /// Central application state; database work is sent to independent Tokio tasks.
 pub struct App {
   pub should_quit: bool,
-  pub focus: Focus,
   pub profiles: Vec<ConnectionProfile>,
   pub scripts: Vec<String>,
   pub expanded: HashSet<NodeKey>,
@@ -334,17 +340,12 @@ pub struct App {
   pub explorer_selected: usize,
   pub explorer_width_percent: u16,
   pub sql_height_percent: u16,
+  pub workspace: Workspace,
+  workspaces: HashMap<(String, String), Workspace>,
+  // One editor lets the same SQL run against different targets without losing undo state.
   pub sql: SqlEditor,
-  pub result: QueryResult,
-  pub result_row: usize,
-  pub result_column: usize,
+  sessions: db::SessionManager,
   pub active_target: Option<(String, String)>,
-  pub overlay: Option<Overlay>,
-  pub busy: Option<String>,
-  pub status: String,
-  pub status_is_error: bool,
-  pending_row_edit: Option<RowDetail>,
-  database_task: Option<db::Task>,
   next_operation_id: u64,
   storage: Storage,
   runtime: Handle,
@@ -363,7 +364,6 @@ impl App {
   ) -> Self {
     Self {
       should_quit: false,
-      focus: Focus::Explorer,
       profiles,
       scripts,
       expanded: HashSet::new(),
@@ -373,17 +373,11 @@ impl App {
       explorer_selected: 0,
       explorer_width_percent: 25,
       sql_height_percent: 34,
+      workspace: Workspace::default(),
+      workspaces: HashMap::new(),
       sql: sql_editor(""),
-      result: QueryResult::default(),
-      result_row: 0,
-      result_column: 0,
+      sessions: db::SessionManager::default(),
       active_target: None,
-      overlay: None,
-      busy: None,
-      status: "Ready".into(),
-      status_is_error: false,
-      pending_row_edit: None,
-      database_task: None,
       next_operation_id: 1,
       storage,
       runtime,
@@ -461,21 +455,43 @@ impl App {
 
   /// Routes keys to the active overlay or pane before any global action.
   pub fn handle_key(&mut self, key: KeyEvent) {
-    if self.overlay.is_some() {
+    if self.workspace.overlay.is_some() {
       self.handle_overlay_key(key);
       return;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-      self.should_quit = true;
+      self.request_session_action(SessionAction::Quit);
       return;
     }
-    if key.code == KeyCode::Esc && self.database_task.is_some() {
+    // Workspace navigation stays available while another database is busy.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+      && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+    {
+      self.cycle_workspace(key.code == KeyCode::PageDown);
+      return;
+    }
+    match key.code {
+      KeyCode::F(6) => {
+        self.request_session_action(SessionAction::Connect);
+        return;
+      }
+      KeyCode::F(7) => {
+        self.request_session_action(SessionAction::Disconnect);
+        return;
+      }
+      KeyCode::F(8) => {
+        self.request_session_action(SessionAction::Reconnect);
+        return;
+      }
+      _ => {}
+    }
+    if key.code == KeyCode::Esc && self.workspace.database_task.is_some() {
       self.cancel_database_operation();
       return;
     }
     match key.code {
       KeyCode::Tab => {
-        self.focus = match self.focus {
+        self.workspace.focus = match self.workspace.focus {
           Focus::Explorer => Focus::Sql,
           Focus::Sql => Focus::Results,
           Focus::Results => Focus::Explorer,
@@ -483,7 +499,7 @@ impl App {
         return;
       }
       KeyCode::BackTab => {
-        self.focus = match self.focus {
+        self.workspace.focus = match self.workspace.focus {
           Focus::Explorer => Focus::Results,
           Focus::Sql => Focus::Explorer,
           Focus::Results => Focus::Sql,
@@ -493,93 +509,10 @@ impl App {
       _ => {}
     }
 
-    match self.focus {
+    match self.workspace.focus {
       Focus::Explorer => self.handle_explorer_key(key),
       Focus::Sql => self.handle_sql_key(key),
       Focus::Results => self.handle_results_key(key),
-    }
-  }
-
-  /// Applies output only when it belongs to the active operation.
-  pub fn handle_database_response(&mut self, response: Response) {
-    if self
-      .database_task
-      .as_ref()
-      .is_none_or(|task| task.operation_id() != response.operation_id)
-    {
-      // Ignore stale responses without discarding the active worker's actual outcome.
-      return;
-    }
-    self.database_task = None;
-    self.busy = None;
-    match response.result {
-      Ok(Output::Databases { profile_id, names }) => {
-        let count = names.len();
-        self.databases.insert(profile_id, names);
-        self.set_status(format!("Loaded {count} database(s)"), false);
-      }
-      Ok(Output::Schemas {
-        profile_id,
-        database,
-        names,
-      }) => {
-        let count = names.len();
-        self.schemas.insert((profile_id, database), names);
-        self.set_status(format!("Loaded {count} schema(s)"), false);
-      }
-      Ok(Output::Tables {
-        profile_id,
-        database,
-        schema,
-        tables,
-      }) => {
-        let count = tables.len();
-        self.tables.insert((profile_id, database, schema), tables);
-        self.set_status(format!("Loaded {count} relation(s)"), false);
-      }
-      Ok(Output::Result(result)) => {
-        let status = result.status.clone();
-        self.result = result;
-        self.result_row = 0;
-        self.result_column = 0;
-        self.focus = Focus::Results;
-        self.set_status(status, false);
-      }
-      Ok(Output::Updated(result)) => {
-        self.pending_row_edit = None;
-        self.result_row = 0;
-        self.result_column = 0;
-        self.focus = Focus::Results;
-        match result {
-          Ok(result) => {
-            let status = format!("Row saved; {}", result.status);
-            self.result = result;
-            self.set_status(status, false);
-          }
-          Err(error) => {
-            // Old row values must not remain editable after a committed write.
-            self.result = QueryResult::default();
-            if error.is::<db::Cancelled>() {
-              self.set_status("Row saved; refresh cancelled".into(), false);
-            } else {
-              self.set_status(
-                format!("Row saved; refresh failed: {}", db::format_error(&error)),
-                true,
-              );
-            }
-          }
-        }
-      }
-      Err(error) => {
-        if let Some(form) = self.pending_row_edit.take() {
-          self.overlay = Some(Overlay::RowDetail(Box::new(form)));
-        }
-        if error.is::<db::Cancelled>() {
-          self.set_status(error.to_string(), false);
-        } else {
-          self.set_status(db::format_error(&error), true);
-        }
-      }
     }
   }
 
@@ -611,7 +544,7 @@ impl App {
       KeyCode::Left => self.collapse_selected(),
       KeyCode::Char('n') => {
         // Keep the larger multi-section form outside the compact overlay enum.
-        self.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::new())));
+        self.workspace.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::new())));
       }
       KeyCode::Char('e') => self.edit_selected_connection(),
       KeyCode::Char('d') => self.confirm_delete_selected_connection(),
@@ -640,7 +573,7 @@ impl App {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
       match key.code {
         KeyCode::Char('s') => {
-          self.overlay = Some(Overlay::SaveScript {
+          self.workspace.overlay = Some(Overlay::SaveScript {
             name: String::new(),
             cursor: 0,
           });
@@ -658,20 +591,23 @@ impl App {
 
   fn handle_results_key(&mut self, key: KeyEvent) {
     match key.code {
-      KeyCode::Up | KeyCode::Char('k') => self.result_row = self.result_row.saturating_sub(1),
+      KeyCode::Up | KeyCode::Char('k') => {
+        self.workspace.result_row = self.workspace.result_row.saturating_sub(1)
+      }
       KeyCode::Down | KeyCode::Char('j') => {
-        self.result_row = (self.result_row + 1).min(self.result.rows.len().saturating_sub(1))
+        self.workspace.result_row =
+          (self.workspace.result_row + 1).min(self.workspace.result.rows.len().saturating_sub(1))
       }
       KeyCode::Left | KeyCode::Char('h') => {
-        self.result_column = self.result_column.saturating_sub(1)
+        self.workspace.result_column = self.workspace.result_column.saturating_sub(1)
       }
       KeyCode::Right | KeyCode::Char('l') => {
-        self.result_column =
-          (self.result_column + 1).min(self.result.columns.len().saturating_sub(1))
+        self.workspace.result_column = (self.workspace.result_column + 1)
+          .min(self.workspace.result.columns.len().saturating_sub(1))
       }
-      KeyCode::Home | KeyCode::Char('g') => self.result_row = 0,
+      KeyCode::Home | KeyCode::Char('g') => self.workspace.result_row = 0,
       KeyCode::End | KeyCode::Char('G') => {
-        self.result_row = self.result.rows.len().saturating_sub(1)
+        self.workspace.result_row = self.workspace.result.rows.len().saturating_sub(1)
       }
       KeyCode::Enter => self.open_row_detail(),
       _ => {}
@@ -679,7 +615,7 @@ impl App {
   }
 
   fn handle_overlay_key(&mut self, key: KeyEvent) {
-    let Some(mut overlay) = self.overlay.take() else {
+    let Some(mut overlay) = self.workspace.overlay.take() else {
       return;
     };
     match &mut overlay {
@@ -690,7 +626,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
           if let Err(error) = self.save_connection(form) {
             self.set_status(error, true);
-            self.overlay = Some(overlay);
+            self.workspace.overlay = Some(overlay);
           }
           return;
         }
@@ -705,7 +641,7 @@ impl App {
           }
           _ => form.handle_text_key(key),
         }
-        self.overlay = Some(overlay);
+        self.workspace.overlay = Some(overlay);
       }
       Overlay::SaveScript { name, cursor } => {
         if key.code == KeyCode::Esc {
@@ -726,13 +662,13 @@ impl App {
             }
             Err(error) => {
               self.set_status(format!("Could not save script: {error:#}"), true);
-              self.overlay = Some(overlay);
+              self.workspace.overlay = Some(overlay);
             }
           }
           return;
         }
         edit_single_line(name, cursor, key);
-        self.overlay = Some(overlay);
+        self.workspace.overlay = Some(overlay);
       }
       Overlay::LoadScript { selected } => {
         if key.code == KeyCode::Esc {
@@ -757,19 +693,19 @@ impl App {
             match self.storage.load_script(&name) {
               Ok(script) => {
                 self.sql = sql_editor(&script.sql);
-                self.focus = Focus::Sql;
+                self.workspace.focus = Focus::Sql;
                 self.set_status(format!("Loaded {}.sql", script.name), false);
               }
               Err(error) => {
                 self.set_status(format!("Could not load script: {error:#}"), true);
-                self.overlay = Some(overlay);
+                self.workspace.overlay = Some(overlay);
               }
             }
             return;
           }
           _ => {}
         }
-        self.overlay = Some(overlay);
+        self.workspace.overlay = Some(overlay);
       }
       Overlay::RowDetail(form) => {
         if form.editing {
@@ -777,7 +713,7 @@ impl App {
             form.finish_edit();
             if let Err(error) = self.save_row(form) {
               self.set_status(error, true);
-              self.overlay = Some(overlay);
+              self.workspace.overlay = Some(overlay);
             }
             return;
           } else if key.code == KeyCode::Esc {
@@ -788,7 +724,7 @@ impl App {
           } else {
             form.editor.input(key);
           }
-          self.overlay = Some(overlay);
+          self.workspace.overlay = Some(overlay);
           return;
         }
         if key.code == KeyCode::Esc {
@@ -797,7 +733,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
           if let Err(error) = self.save_row(form) {
             self.set_status(error, true);
-            self.overlay = Some(overlay);
+            self.workspace.overlay = Some(overlay);
           }
           return;
         }
@@ -816,38 +752,59 @@ impl App {
           KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => form.toggle_null(),
           _ => {}
         }
-        self.overlay = Some(overlay);
+        self.workspace.overlay = Some(overlay);
       }
+      Overlay::ConfirmSession(action) => match key.code {
+        KeyCode::Char('y') => self.perform_session_action(*action),
+        KeyCode::Char('n') | KeyCode::Esc => {}
+        _ => self.workspace.overlay = Some(overlay),
+      },
       Overlay::ConfirmDelete { profile_id, .. } => match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
           self.delete_connection(profile_id);
         }
         KeyCode::Char('n') | KeyCode::Esc => {}
-        _ => self.overlay = Some(overlay),
+        _ => self.workspace.overlay = Some(overlay),
       },
     }
   }
 
   fn activate_selected(&mut self) {
-    if self.busy.is_some() {
-      return;
-    }
     let Some(row) = self.explorer_rows().get(self.explorer_selected).cloned() else {
       return;
     };
+    // Switch first so a busy database never blocks navigation to another workspace.
+    let target = match &row.node {
+      ExplorerNode::Connection(id) => self
+        .profile(id)
+        .map(|profile| (id.clone(), profile.database.clone())),
+      ExplorerNode::Database {
+        profile_id,
+        database,
+      }
+      | ExplorerNode::Schema {
+        profile_id,
+        database,
+        ..
+      } => Some((profile_id.clone(), database.clone())),
+      ExplorerNode::Table(table) => Some((table.profile_id.clone(), table.database.clone())),
+    };
+    let Some(target) = target else {
+      return;
+    };
+    self.switch_workspace(target);
+    if self.workspace.database_task.is_some() {
+      return;
+    }
     match row.node {
       ExplorerNode::Connection(profile_id) => {
-        self.active_target = self
-          .profile(&profile_id)
-          .map(|profile| (profile_id.clone(), profile.database.clone()));
         let key = NodeKey::Connection(profile_id.clone());
         if self.expanded.remove(&key) {
           return;
         }
         self.expanded.insert(key);
-        if !self.databases.contains_key(&profile_id)
-          && let Some(profile) = self.profile(&profile_id).cloned()
-        {
+        // Expansion ensures a persistent session even when metadata was cached.
+        if let Some(profile) = self.profile(&profile_id).cloned() {
           self.dispatch(
             format!("Connecting to {}", profile.name),
             Request::Databases {
@@ -861,17 +818,13 @@ impl App {
         profile_id,
         database,
       } => {
-        self.active_target = Some((profile_id.clone(), database.clone()));
         let key = NodeKey::Database(profile_id.clone(), database.clone());
         if self.expanded.remove(&key) {
           return;
         }
         self.expanded.insert(key);
-        if !self
-          .schemas
-          .contains_key(&(profile_id.clone(), database.clone()))
-          && let Some(profile) = self.profile(&profile_id).cloned()
-        {
+        // Refresh through a separate metadata connection, preserving the SQL transaction.
+        if let Some(profile) = self.profile(&profile_id).cloned() {
           self.dispatch(
             format!("Loading schemas from {database}"),
             Request::Schemas {
@@ -887,7 +840,6 @@ impl App {
         database,
         schema,
       } => {
-        self.active_target = Some((profile_id.clone(), database.clone()));
         let key = NodeKey::Schema(profile_id.clone(), database.clone(), schema.clone());
         if self.expanded.remove(&key) {
           return;
@@ -910,7 +862,6 @@ impl App {
         }
       }
       ExplorerNode::Table(table) => {
-        self.active_target = Some((table.profile_id.clone(), table.database.clone()));
         if let Some(profile) = self.profile(&table.profile_id).cloned() {
           self.dispatch(
             format!("Previewing {}.{}", table.schema, table.name),
@@ -948,7 +899,7 @@ impl App {
   }
 
   fn run_sql(&mut self) {
-    if self.busy.is_some() {
+    if self.workspace.busy.is_some() {
       return;
     }
     let sql = self.sql.lines().join("\n");
@@ -970,7 +921,6 @@ impl App {
     self.dispatch(
       format!("Running SQL on {database}"),
       Request::Query {
-        password: self.password(&profile_id),
         profile,
         database,
         sql,
@@ -979,16 +929,16 @@ impl App {
   }
 
   fn open_row_detail(&mut self) {
-    if let Some(form) = RowDetail::new(&self.result, self.result_row) {
+    if let Some(form) = RowDetail::new(&self.workspace.result, self.workspace.result_row) {
       // Keep the large multiline editor outside the compact overlay enum.
-      self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+      self.workspace.overlay = Some(Overlay::RowDetail(Box::new(form)));
     } else {
       self.set_status("Select a result row to inspect it".into(), true);
     }
   }
 
   fn save_row(&mut self, form: &RowDetail) -> Result<(), String> {
-    if self.busy.is_some() {
+    if self.workspace.busy.is_some() {
       return Err("Wait for the current database operation to finish".into());
     }
     let source = form
@@ -996,7 +946,7 @@ impl App {
       .clone()
       .ok_or_else(|| "Custom SQL results are read-only".to_owned())?;
     // A retained row form must not dispatch an update after its preview is invalidated.
-    if self.result.source.as_ref() != Some(&source) {
+    if self.workspace.result.source.as_ref() != Some(&source) {
       return Err("The table preview is no longer current; reload the table before saving".into());
     }
     if !source.columns.iter().any(|column| column.primary_key) {
@@ -1010,7 +960,7 @@ impl App {
       .profile(profile_id)
       .cloned()
       .ok_or_else(|| "The source connection no longer exists".to_owned())?;
-    self.pending_row_edit = Some(form.clone());
+    self.workspace.pending_row_edit = Some(form.clone());
     self.dispatch(
       format!(
         "Updating row in {}.{}",
@@ -1029,22 +979,26 @@ impl App {
 
   fn dispatch(&mut self, description: String, request: Request) {
     // One operation at a time keeps cancellation and response ownership exact.
-    debug_assert!(self.database_task.is_none());
+    if self.workspace.database_task.is_some() {
+      self.set_status("Wait for this workspace's operation to finish".into(), true);
+      return;
+    }
     let operation_id = self.next_operation_id;
     self.next_operation_id = self.next_operation_id.wrapping_add(1);
-    self.busy = Some(description.clone());
+    self.workspace.busy = Some(description.clone());
     self.set_status(description, false);
-    self.database_task = Some(db::spawn(
+    self.workspace.database_task = Some(db::spawn(
       &self.runtime,
       self.database_tx.clone(),
       self.tunnels.clone(),
+      self.sessions.clone(),
       operation_id,
       request,
     ));
   }
 
   fn cancel_database_operation(&mut self) {
-    let Some(task) = self.database_task.as_ref() else {
+    let Some(task) = self.workspace.database_task.as_ref() else {
       return;
     };
     // Keep the operation and pending edits until the worker confirms its outcome.
@@ -1052,16 +1006,8 @@ impl App {
     self.set_status("Cancelling…".into(), false);
   }
 
-  // Normal exit must wait for server cancellation before the runtime shuts down.
-  pub async fn shutdown(&mut self) -> anyhow::Result<()> {
-    if let Some(task) = self.database_task.take() {
-      task.shutdown().await?;
-    }
-    Ok(())
-  }
-
   fn save_connection(&mut self, form: &ConnectionForm) -> Result<(), String> {
-    if self.busy.is_some() {
+    if self.workspace.busy.is_some() {
       return Err("Wait for the current database operation to finish".into());
     }
     let port = form.values[2]
@@ -1088,6 +1034,7 @@ impl App {
       None
     };
     let id = form.editing_id.clone().unwrap_or_else(new_id);
+    self.prepare_profile_change(&id)?;
     self
       .tunnels
       .invalidate(&id)
@@ -1117,7 +1064,7 @@ impl App {
     self.profiles = profiles;
 
     // Endpoint changes invalidate every object loaded through the old profile.
-    self.invalidate_connection_preview(&id);
+    self.invalidate_all_previews(&id);
     self.databases.remove(&id);
     self.schemas.retain(|(profile_id, _), _| profile_id != &id);
     self
@@ -1128,35 +1075,11 @@ impl App {
       .as_ref()
       .is_some_and(|(profile_id, _)| profile_id == &id)
     {
-      self.active_target = None;
+      self.park_workspace();
     }
-    self.overlay = None;
+    self.workspace.overlay = None;
     self.set_status("Connection saved".into(), false);
     Ok(())
-  }
-
-  // Remove editable state before the same profile ID can resolve to another endpoint.
-  fn invalidate_connection_preview(&mut self, profile_id: &str) {
-    let from_profile = |source: &Option<db::TableResultSource>| {
-      source
-        .as_ref()
-        .is_some_and(|source| source.table.profile_id == profile_id)
-    };
-    if from_profile(&self.result.source) {
-      self.result = QueryResult::default();
-      self.result_row = 0;
-      self.result_column = 0;
-    }
-    if self
-      .pending_row_edit
-      .as_ref()
-      .is_some_and(|form| from_profile(&form.source))
-    {
-      self.pending_row_edit = None;
-    }
-    if matches!(&self.overlay, Some(Overlay::RowDetail(form)) if from_profile(&form.source)) {
-      self.overlay = None;
-    }
   }
 
   fn edit_selected_connection(&mut self) {
@@ -1168,7 +1091,7 @@ impl App {
       return;
     };
     if let Some(profile) = self.profile(&profile_id) {
-      self.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::edit(profile))));
+      self.workspace.overlay = Some(Overlay::Connection(Box::new(ConnectionForm::edit(profile))));
     }
   }
 
@@ -1181,7 +1104,7 @@ impl App {
       return;
     };
     if let Some(profile) = self.profile(&profile_id) {
-      self.overlay = Some(Overlay::ConfirmDelete {
+      self.workspace.overlay = Some(Overlay::ConfirmDelete {
         profile_id,
         name: profile.name.clone(),
       });
@@ -1189,11 +1112,15 @@ impl App {
   }
 
   fn delete_connection(&mut self, profile_id: &str) {
-    if self.busy.is_some() {
+    if self.workspace.busy.is_some() {
       self.set_status(
         "Wait for the current database operation to finish".into(),
         true,
       );
+      return;
+    }
+    if let Err(error) = self.prepare_profile_change(profile_id) {
+      self.set_status(error, true);
       return;
     }
     if let Err(error) = self.tunnels.invalidate(profile_id) {
@@ -1208,7 +1135,7 @@ impl App {
       return;
     }
     // Deleted profiles must not leave a preview that still appears editable.
-    self.invalidate_connection_preview(profile_id);
+    self.invalidate_all_previews(profile_id);
     self.databases.remove(profile_id);
     self.schemas.retain(|(id, _), _| id != profile_id);
     self.tables.retain(|(id, _, _), _| id != profile_id);
@@ -1217,7 +1144,7 @@ impl App {
       .as_ref()
       .is_some_and(|(id, _)| id == profile_id)
     {
-      self.active_target = None;
+      self.park_workspace();
     }
     self.explorer_selected = self
       .explorer_selected
@@ -1231,7 +1158,7 @@ impl App {
       self.set_status("No saved scripts".into(), true);
       return;
     }
-    self.overlay = Some(Overlay::LoadScript { selected: 0 });
+    self.workspace.overlay = Some(Overlay::LoadScript { selected: 0 });
   }
 
   // Bound user resizing so every pane remains usable on ordinary terminals.
@@ -1265,8 +1192,8 @@ impl App {
   }
 
   fn set_status(&mut self, status: String, is_error: bool) {
-    self.status = status;
-    self.status_is_error = is_error;
+    self.workspace.status = status;
+    self.workspace.status_is_error = is_error;
   }
 }
 
@@ -1357,6 +1284,8 @@ fn is_run_key(key: KeyEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+  // Session tests share the deterministic, network-free application fixtures.
+  mod sessions;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 
@@ -1422,19 +1351,21 @@ mod tests {
         password: None,
       },
     );
-    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    let operation_id = app.workspace.database_task.as_ref().unwrap().operation_id();
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert!(app.busy.is_some());
-    assert!(app.database_task.is_some());
-    assert_eq!(app.status, "Cancelling…");
+    assert!(app.workspace.busy.is_some());
+    assert!(app.workspace.database_task.is_some());
+    assert_eq!(app.workspace.status, "Cancelling…");
     app.handle_database_response(Response {
+      session_state: None,
       operation_id: operation_id + 1,
       result: Err(db::Cancelled.into()),
     });
-    assert!(app.busy.is_some());
+    assert!(app.workspace.busy.is_some());
     app.handle_database_response(Response {
+      session_state: None,
       operation_id,
       result: Ok(Output::Databases {
         profile_id: "local".into(),
@@ -1442,60 +1373,68 @@ mod tests {
       }),
     });
     assert_eq!(app.databases["local"], vec!["completed_before_cancel"]);
-    assert!(app.busy.is_none());
-    assert!(app.database_task.is_none());
-    assert_eq!(app.status, "Loaded 1 database(s)");
+    assert!(app.workspace.busy.is_none());
+    assert!(app.workspace.database_task.is_none());
+    assert_eq!(app.workspace.status, "Loaded 1 database(s)");
   }
 
   // Unsaved values remain recoverable only after the worker confirms cancellation.
   #[test]
   fn confirmed_cancellation_restores_pending_row_edits() {
     let (_directory, _runtime, mut app) = pending_row_app();
-    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    let operation_id = app.workspace.database_task.as_ref().unwrap().operation_id();
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(app.overlay.is_none());
-    assert!(app.pending_row_edit.is_some());
+    assert!(app.workspace.overlay.is_none());
+    assert!(app.workspace.pending_row_edit.is_some());
     app.handle_database_response(Response {
+      session_state: None,
       operation_id,
       result: Err(db::Cancelled.into()),
     });
-    let Some(Overlay::RowDetail(form)) = &app.overlay else {
+    let Some(Overlay::RowDetail(form)) = &app.workspace.overlay else {
       panic!("cancelled edit must be restored");
     };
     assert_eq!(form.values[1].as_deref(), Some("changed"));
-    assert!(!app.status_is_error);
-    assert!(app.busy.is_none());
+    assert!(!app.workspace.status_is_error);
+    assert!(app.workspace.busy.is_none());
   }
 
   // A saved row must not be offered for retry when only its preview was cancelled.
   #[test]
   fn cancelled_refresh_preserves_the_committed_write_outcome() {
     let (_directory, _runtime, mut app) = pending_row_app();
-    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    let operation_id = app.workspace.database_task.as_ref().unwrap().operation_id();
     app.handle_database_response(Response {
+      session_state: None,
       operation_id,
       result: Ok(Output::Updated(Err(db::Cancelled.into()))),
     });
-    assert_eq!(app.status, "Row saved; refresh cancelled");
-    assert!(app.pending_row_edit.is_none());
-    assert!(app.overlay.is_none());
-    assert!(app.result.source.is_none());
-    assert!(app.result.rows.is_empty());
+    assert_eq!(app.workspace.status, "Row saved; refresh cancelled");
+    assert!(app.workspace.pending_row_edit.is_none());
+    assert!(app.workspace.overlay.is_none());
+    assert!(app.workspace.result.source.is_none());
+    assert!(app.workspace.result.rows.is_empty());
   }
 
   // Server and connection failures during refresh have the same committed-write boundary.
   #[test]
   fn failed_refresh_does_not_restore_an_already_saved_edit() {
     let (_directory, _runtime, mut app) = pending_row_app();
-    let operation_id = app.database_task.as_ref().unwrap().operation_id();
+    let operation_id = app.workspace.database_task.as_ref().unwrap().operation_id();
     app.handle_database_response(Response {
+      session_state: None,
       operation_id,
       result: Ok(Output::Updated(Err(anyhow::anyhow!("connection closed")))),
     });
-    assert!(app.status.starts_with("Row saved; refresh failed:"));
-    assert!(app.status_is_error);
-    assert!(app.pending_row_edit.is_none());
-    assert!(app.overlay.is_none());
+    assert!(
+      app
+        .workspace
+        .status
+        .starts_with("Row saved; refresh failed:")
+    );
+    assert!(app.workspace.status_is_error);
+    assert!(app.workspace.pending_row_edit.is_none());
+    assert!(app.workspace.overlay.is_none());
   }
 
   // Saving a changed endpoint must prevent the original preview from targeting that endpoint.
@@ -1507,18 +1446,18 @@ mod tests {
       other.id = "other".into();
       app.profiles.push(other);
       app.active_target = Some((active_profile.into(), "postgres".into()));
-      app.result.rows.push(vec![
+      app.workspace.result.rows.push(vec![
         Some("8".into()),
         Some("second".into()),
         Some("generated".into()),
       ]);
-      app.result_row = 1;
-      app.result_column = 2;
-      let mut old_form = RowDetail::new(&app.result, 1).unwrap();
+      app.workspace.result_row = 1;
+      app.workspace.result_column = 2;
+      let mut old_form = RowDetail::new(&app.workspace.result, 1).unwrap();
       old_form.values[1] = Some("changed".into());
 
       app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-      let Some(Overlay::Connection(form)) = &mut app.overlay else {
+      let Some(Overlay::Connection(form)) = &mut app.workspace.overlay else {
         panic!("connection editor must open");
       };
       form.values[1] = "new-server".into();
@@ -1526,19 +1465,22 @@ mod tests {
 
       assert_eq!(app.profile("local").unwrap().host, "new-server");
       assert_eq!(app.storage.load_connections().unwrap(), app.profiles);
-      assert_eq!(app.result, QueryResult::default());
-      assert_eq!((app.result_row, app.result_column), (0, 0));
+      assert_eq!(app.workspace.result, QueryResult::default());
+      assert_eq!(
+        (app.workspace.result_row, app.workspace.result_column),
+        (0, 0)
+      );
       assert!(
         app
           .save_row(&old_form)
           .unwrap_err()
           .contains("reload the table")
       );
-      assert!(app.database_task.is_none());
-      assert!(app.pending_row_edit.is_none());
-      app.focus = Focus::Results;
+      assert!(app.workspace.database_task.is_none());
+      assert!(app.workspace.pending_row_edit.is_none());
+      app.workspace.focus = Focus::Results;
       app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-      assert!(app.overlay.is_none());
+      assert!(app.workspace.overlay.is_none());
     }
   }
 
@@ -1546,25 +1488,25 @@ mod tests {
   #[test]
   fn changing_another_connection_preserves_the_current_preview() {
     let (_directory, _runtime, mut app) = preview_app();
-    let result = app.result.clone();
+    let result = app.workspace.result.clone();
     let mut other = app.profiles[0].clone();
     other.id = "other".into();
     app.profiles.push(other.clone());
-    app.active_target = Some((other.id.clone(), "postgres".into()));
-    app.result_column = 2;
+    app.active_target = Some(("local".into(), "postgres".into()));
+    app.workspace.result_column = 2;
     let mut connection_form = ConnectionForm::edit(&other);
     connection_form.values[1] = "new-server".into();
 
     app.save_connection(&connection_form).unwrap();
-    assert_eq!(app.result, result);
-    assert_eq!(app.result_column, 2);
+    assert_eq!(app.workspace.result, result);
+    assert_eq!(app.workspace.result_column, 2);
     app.delete_connection("other");
-    assert_eq!(app.result, result);
-    assert_eq!(app.result_column, 2);
-    let mut row_form = RowDetail::new(&app.result, 0).unwrap();
+    assert_eq!(app.workspace.result, result);
+    assert_eq!(app.workspace.result_column, 2);
+    let mut row_form = RowDetail::new(&app.workspace.result, 0).unwrap();
     row_form.values[1] = Some("changed".into());
     app.save_row(&row_form).unwrap();
-    assert!(app.database_task.is_some());
+    assert!(app.workspace.database_task.is_some());
   }
 
   // A failed disk save leaves the old endpoint and its editable preview valid.
@@ -1573,7 +1515,7 @@ mod tests {
     let (_directory, _runtime, mut app) = preview_app();
     app.storage.save_connections(&app.profiles).unwrap();
     let profiles = app.profiles.clone();
-    let result = app.result.clone();
+    let result = app.workspace.result.clone();
     app.active_target = Some(("local".into(), "postgres".into()));
     let target = app.active_target.clone();
     let mut connection_form = ConnectionForm::edit(&app.profiles[0]);
@@ -1584,31 +1526,34 @@ mod tests {
     assert!(app.save_connection(&connection_form).is_err());
     assert_eq!(app.profiles, profiles);
     assert_eq!(app.storage.load_connections().unwrap(), profiles);
-    assert_eq!(app.result, result);
+    assert_eq!(app.workspace.result, result);
     assert_eq!(app.active_target, target);
-    let mut row_form = RowDetail::new(&app.result, 0).unwrap();
+    let mut row_form = RowDetail::new(&app.workspace.result, 0).unwrap();
     row_form.values[1] = Some("changed".into());
     app.save_row(&row_form).unwrap();
-    assert!(app.database_task.is_some());
+    assert!(app.workspace.database_task.is_some());
   }
 
   // A deleted source must not leave editable rows or permit a retained form to dispatch a write.
   #[test]
   fn connection_deletion_invalidates_its_preview() {
     let (_directory, _runtime, mut app) = preview_app();
-    let mut old_form = RowDetail::new(&app.result, 0).unwrap();
+    let mut old_form = RowDetail::new(&app.workspace.result, 0).unwrap();
     old_form.values[1] = Some("changed".into());
-    app.result_column = 2;
+    app.workspace.result_column = 2;
     app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
     app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
     assert!(app.profiles.is_empty());
     assert!(app.storage.load_connections().unwrap().is_empty());
-    assert_eq!(app.result, QueryResult::default());
-    assert_eq!((app.result_row, app.result_column), (0, 0));
-    assert!(app.overlay.is_none());
+    assert_eq!(app.workspace.result, QueryResult::default());
+    assert_eq!(
+      (app.workspace.result_row, app.workspace.result_column),
+      (0, 0)
+    );
+    assert!(app.workspace.overlay.is_none());
     assert!(app.save_row(&old_form).is_err());
-    assert!(app.database_task.is_none());
+    assert!(app.workspace.database_task.is_none());
   }
 
   // Failed deletion must preserve the preview along with the restored connection profile.
@@ -1617,14 +1562,14 @@ mod tests {
     let (_directory, _runtime, mut app) = preview_app();
     app.storage.save_connections(&app.profiles).unwrap();
     let profiles = app.profiles.clone();
-    let result = app.result.clone();
+    let result = app.workspace.result.clone();
     std::fs::create_dir(app.storage.root().join("connections.toml.tmp")).unwrap();
 
     app.delete_connection("local");
-    assert!(app.status_is_error);
+    assert!(app.workspace.status_is_error);
     assert_eq!(app.profiles, profiles);
     assert_eq!(app.storage.load_connections().unwrap(), profiles);
-    assert_eq!(app.result, result);
+    assert_eq!(app.workspace.result, result);
   }
 
   // An unpolled runtime keeps profile and preview tests independent of network access.
@@ -1653,14 +1598,14 @@ mod tests {
       runtime.handle().clone(),
       sender,
     );
-    app.result = editable_result();
+    app.workspace.result = editable_result();
     (directory, runtime, app)
   }
 
   // Reuse a valid preview so cancellation tests start with a dispatched row edit.
   fn pending_row_app() -> (tempfile::TempDir, tokio::runtime::Runtime, App) {
     let (directory, runtime, mut app) = preview_app();
-    let mut form = RowDetail::new(&app.result, 0).unwrap();
+    let mut form = RowDetail::new(&app.workspace.result, 0).unwrap();
     form.values[1] = Some("changed".into());
     app.save_row(&form).unwrap();
     (directory, runtime, app)

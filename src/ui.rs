@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
   app::{App, ConnectionField, ExplorerNode, ExplorerRow, Focus, NodeKey, Overlay},
+  db::{SessionState, TransactionState},
   theme::THEME,
 };
 
@@ -22,10 +23,21 @@ const MAX_COLUMN_WIDTH: usize = 48;
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
   // Separate messages from controls so neither competes for horizontal space.
   let status_height = status_height(app, frame.area().width);
-  let page = Layout::vertical([Constraint::Min(8), Constraint::Length(status_height + 1)])
-    .split(frame.area());
-  let footer =
-    Layout::vertical([Constraint::Length(status_height), Constraint::Length(1)]).split(page[1]);
+  let controls = shortcut_line(&shortcuts(app));
+  let shortcut_height = controls
+    .width()
+    .div_ceil(usize::from(frame.area().width.saturating_sub(2).max(1)))
+    .clamp(1, 3) as u16;
+  let page = Layout::vertical([
+    Constraint::Min(8),
+    Constraint::Length(status_height + shortcut_height),
+  ])
+  .split(frame.area());
+  let footer = Layout::vertical([
+    Constraint::Length(status_height),
+    Constraint::Length(shortcut_height),
+  ])
+  .split(page[1]);
   // Give query editing and results more room than the compact connection tree.
   let work = Layout::horizontal([
     Constraint::Percentage(app.explorer_width_percent),
@@ -44,7 +56,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
   draw_status(frame, app, footer[0]);
   draw_shortcuts(frame, app, footer[1]);
 
-  if let Some(overlay) = &app.overlay {
+  if let Some(overlay) = &app.workspace.overlay {
     draw_overlay(frame, overlay, &app.scripts);
   }
 }
@@ -58,38 +70,54 @@ fn draw_explorer(frame: &mut Frame<'_>, app: &App, area: Rect) {
       None => "  ",
     };
     let indentation = "  ".repeat(row.depth);
-    explorer_item(row, &indentation, prefix)
+    explorer_item(row, &indentation, prefix, app.explorer_connected(&row.node))
   });
   // An empty connection list has no valid selected row.
   let mut state =
     ListState::default().with_selected((!rows.is_empty()).then_some(app.explorer_selected));
   let list = List::new(items)
-    .block(pane_block(" Explorer ", app.focus == Focus::Explorer))
-    .highlight_style(
-      Style::default()
-        .bg(THEME.selection)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD),
-    )
+    .block(pane_block(
+      " Explorer ",
+      app.workspace.focus == Focus::Explorer,
+    ))
+    .highlight_style(Style::default().bg(THEME.selection).fg(Color::White))
     .highlight_symbol("› ");
   frame.render_stateful_widget(list, area, &mut state);
 }
 
 // Color hierarchy levels by meaning so dense explorer trees remain scannable.
-fn explorer_item(row: &ExplorerRow, indentation: &str, prefix: &str) -> ListItem<'static> {
+fn explorer_item(
+  row: &ExplorerRow,
+  indentation: &str,
+  prefix: &str,
+  connected: bool,
+) -> ListItem<'static> {
   let mut spans = vec![Span::styled(
     format!("{indentation}{prefix}"),
     Style::default().fg(THEME.muted),
   )];
   match &row.node {
-    ExplorerNode::Connection(_) => spans.push(Span::styled(
-      row.label.clone(),
-      Style::default().fg(THEME.cyan).add_modifier(Modifier::BOLD),
-    )),
-    ExplorerNode::Database { .. } => spans.push(Span::styled(
-      row.label.clone(),
-      Style::default().fg(THEME.accent),
-    )),
+    ExplorerNode::Connection(_) | ExplorerNode::Database { .. } => {
+      // Shape conveys connection state even when terminal color or bold is unavailable.
+      spans.push(Span::styled(
+        if connected { "● " } else { "○ " },
+        Style::default().fg(if connected { THEME.green } else { THEME.muted }),
+      ));
+      let color = if matches!(row.node, ExplorerNode::Connection(_)) {
+        THEME.cyan
+      } else {
+        THEME.accent
+      };
+      let style = Style::default().fg(color);
+      spans.push(Span::styled(
+        row.label.clone(),
+        if connected {
+          style.add_modifier(Modifier::BOLD)
+        } else {
+          style
+        },
+      ));
+    }
     ExplorerNode::Schema { .. } => spans.push(Span::styled(
       row.label.clone(),
       Style::default().fg(THEME.purple),
@@ -125,22 +153,31 @@ fn draw_sql(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .find(|profile| profile.id == *profile_id)
         .map_or(profile_id.as_str(), |profile| profile.name.as_str());
-      format!(" SQL · {name}/{database} ")
+      // Normal autocommit needs no warning; retain transaction and connection diagnostics.
+      match app.workspace.session_state {
+        SessionState::Connected(TransactionState::Idle) => format!(" SQL · {name}/{database} "),
+        state => format!(" SQL · {name}/{database} · {} ", state.label()),
+      }
     })
     .unwrap_or_else(|| " SQL · select a database target ".into());
   app
     .sql
-    .set_block(pane_block(&target, app.focus == Focus::Sql));
+    .set_block(pane_block(&target, app.workspace.focus == Focus::Sql));
   frame.render_widget(&app.sql, area);
 }
 
 fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
-  let block = pane_block(" Results ", app.focus == Focus::Results);
-  if app.result.columns.is_empty() {
-    let text = if app.result.status.is_empty() {
+  // Use the result's known object, never the currently selected Explorer row or SQL text.
+  let title = app.workspace.result.source.as_ref().map_or_else(
+    || " SQL results ".to_owned(),
+    |source| format!(" Results · {}.{} ", source.table.schema, source.table.name),
+  );
+  let block = pane_block(&title, app.workspace.focus == Focus::Results);
+  if app.workspace.result.columns.is_empty() {
+    let text = if app.workspace.result.status.is_empty() {
       "Run SQL or select a table to see rows."
     } else {
-      app.result.status.as_str()
+      app.workspace.result.status.as_str()
     };
     frame.render_widget(
       Paragraph::new(text)
@@ -155,9 +192,10 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
   // Size columns from visible data while bounding sparse IDs and large text values.
   let available = area.width.saturating_sub(4);
   let start = app
+    .workspace
     .result_column
-    .min(app.result.columns.len().saturating_sub(1));
-  let visible = visible_columns(&app.result, start, available);
+    .min(app.workspace.result.columns.len().saturating_sub(1));
+  let visible = visible_columns(&app.workspace.result, start, available);
   let widths = visible
     .iter()
     .map(|(_, width)| Constraint::Length(*width))
@@ -165,7 +203,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
   let header = Row::new(
     visible
       .iter()
-      .map(|(index, _)| Cell::from(app.result.columns[*index].as_str())),
+      .map(|(index, _)| Cell::from(app.workspace.result.columns[*index].as_str())),
   )
   .style(
     Style::default()
@@ -173,17 +211,17 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
       .add_modifier(Modifier::BOLD),
   )
   .bottom_margin(1);
-  let rows = app.result.rows.iter().map(|values| {
+  let rows = app.workspace.result.rows.iter().map(|values| {
     Row::new(visible.iter().map(|(index, _)| {
       let value = values.get(*index).and_then(Option::as_deref);
       result_cell(value)
     }))
   });
   let mut state = TableState::default();
-  state.select(Some(app.result_row));
+  state.select(Some(app.workspace.result_row));
   let viewport_height = area.height.saturating_sub(4) as usize;
-  if app.result_row >= viewport_height && viewport_height > 0 {
-    *state.offset_mut() = app.result_row - viewport_height + 1;
+  if app.workspace.result_row >= viewport_height && viewport_height > 0 {
+    *state.offset_mut() = app.workspace.result_row - viewport_height + 1;
   }
   let table = Table::new(rows, widths)
     .header(header)
@@ -208,16 +246,20 @@ fn result_cell(value: Option<&str>) -> Cell<'static> {
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-  let color = if app.status_is_error {
+  let color = if app.workspace.status_is_error {
     THEME.red
-  } else if app.busy.is_some() {
+  } else if app.workspace.busy.is_some() {
     THEME.yellow
   } else {
     THEME.green
   };
-  let prefix = if app.busy.is_some() { "● " } else { "" };
+  let prefix = if app.workspace.busy.is_some() {
+    "● "
+  } else {
+    ""
+  };
   frame.render_widget(
-    Paragraph::new(format!("{prefix}{}", app.status))
+    Paragraph::new(format!("{prefix}{}", app.workspace.status))
       .style(Style::default().fg(color))
       .wrap(Wrap { trim: false })
       .block(Block::default().padding(Padding::horizontal(1))),
@@ -227,11 +269,12 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Grow error diagnostics while bounding their effect on the main workspace.
 fn status_height(app: &App, area_width: u16) -> u16 {
-  if !app.status_is_error {
+  if !app.workspace.status_is_error {
     return 1;
   }
   let line_width = usize::from(area_width.saturating_sub(2).max(1));
   app
+    .workspace
     .status
     .lines()
     .map(|line| line.width().max(1).div_ceil(line_width))
@@ -243,6 +286,7 @@ fn draw_shortcuts(frame: &mut Frame<'_>, app: &App, area: Rect) {
   let shortcuts = shortcuts(app);
   frame.render_widget(
     Paragraph::new(shortcut_line(&shortcuts))
+      .wrap(Wrap { trim: true })
       .alignment(Alignment::Right)
       .block(Block::default().padding(Padding::horizontal(1))),
     area,
@@ -251,7 +295,7 @@ fn draw_shortcuts(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Show only actions that apply to the active pane or modal dialog.
 fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
-  if let Some(overlay) = &app.overlay {
+  if let Some(overlay) = &app.workspace.overlay {
     return match overlay {
       Overlay::Connection(form) if form.selected_field().is_toggle() => {
         vec![
@@ -284,15 +328,21 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       Overlay::ConfirmDelete { .. } => {
         vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
       }
+      Overlay::ConfirmSession(_) => vec![("Y", "confirm"), ("N/Esc", "cancel")],
     };
   }
 
-  if app.busy.is_some() {
+  if app.workspace.busy.is_some() {
     // Hide inactive pane actions while one database task owns the workspace.
-    return vec![("Esc", "cancel"), ("Tab", "pane"), ("^Q", "quit")];
+    return vec![
+      ("Esc", "cancel"),
+      ("^PgUp/Down", "session"),
+      ("Tab", "pane"),
+      ("^Q", "quit"),
+    ];
   }
 
-  match app.focus {
+  match app.workspace.focus {
     Focus::Explorer => vec![
       ("↑↓", "move"),
       ("Enter/→", "open"),
@@ -306,6 +356,10 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
     ],
     Focus::Sql => vec![
       ("F5/^Enter", "run"),
+      ("F6", "connect"),
+      ("F7", "disconnect"),
+      ("F8", "reconnect"),
+      ("^PgUp/Down", "session"),
       ("^S", "save"),
       ("^L", "load"),
       ("^↑/^↓", "height"),
@@ -468,6 +522,17 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
       frame.render_stateful_widget(list, area, &mut state);
     }
     Overlay::RowDetail(form) => draw_row_detail(frame, form),
+    Overlay::ConfirmSession(action) => {
+      // Require an explicit Y so Enter cannot accidentally discard a transaction.
+      let area = centered(frame.area(), 70, 9);
+      frame.render_widget(Clear, area);
+      frame.render_widget(
+        Paragraph::new(action.confirmation())
+          .wrap(Wrap { trim: false })
+          .block(pane_block(" Close SQL session? ", true).padding(Padding::uniform(1))),
+        area,
+      );
+    }
     Overlay::ConfirmDelete { name, .. } => {
       let area = centered(frame.area(), 50, 5);
       frame.render_widget(Clear, area);
@@ -711,6 +776,9 @@ mod tests {
       runtime.handle().clone(),
       sender,
     );
+    app.active_target = Some(("local".into(), "postgres".into()));
+    app.workspace.session_state =
+      crate::db::SessionState::Connected(crate::db::TransactionState::Idle);
     app.expanded.insert(NodeKey::Connection("local".into()));
     app
       .expanded
@@ -737,10 +805,10 @@ mod tests {
       }],
     );
     app.explorer_selected = 1;
-    app.result.columns = vec!["id".into(), "email".into(), "note".into()];
-    app.result.rows = vec![vec![Some("1".into()), Some("dev@example.com".into()), None]];
+    app.workspace.result.columns = vec!["id".into(), "email".into(), "note".into()];
+    app.workspace.result.rows = vec![vec![Some("1".into()), Some("dev@example.com".into()), None]];
     // Source metadata makes the table-preview row safe to edit.
-    app.result.source = Some(TableResultSource {
+    app.workspace.result.source = Some(TableResultSource {
       table: TableRef {
         profile_id: "local".into(),
         database: "postgres".into(),
@@ -782,6 +850,9 @@ mod tests {
 
     assert!(screen.contains("Local PostgreSQL"));
     assert!(screen.contains("users  [table]"));
+    // Name the displayed result even while a different Explorer row is selected.
+    assert!(screen.contains("Results · public.users"));
+    assert!(!screen.contains("edits autocommit"));
     assert!(!screen.contains("Saved scripts"));
     assert!(!screen.contains("inspect_users.sql"));
     assert!(screen.contains("dev@example.com"));
@@ -799,7 +870,7 @@ mod tests {
     }));
 
     // Enter opens a full row viewer with source and edit state visible.
-    app.focus = Focus::Results;
+    app.workspace.focus = Focus::Results;
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let row_detail = terminal
@@ -815,7 +886,7 @@ mod tests {
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
     // Explorer resize keys adjust the Ratatui layout without collapsing nodes.
-    app.focus = Focus::Explorer;
+    app.workspace.focus = Focus::Explorer;
     app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
     assert_eq!(app.explorer_width_percent, 23);
     assert!(app.expanded.contains(&NodeKey::Connection("local".into())));
@@ -823,7 +894,7 @@ mod tests {
     assert_eq!(app.explorer_width_percent, 25);
 
     // Saved scripts appear only in the SQL pane's load dialog.
-    app.focus = Focus::Sql;
+    app.workspace.focus = Focus::Sql;
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(app.sql_height_percent, 36);
     app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
@@ -844,7 +915,7 @@ mod tests {
     assert_eq!(app.sql.lines(), &["select 42;"]);
 
     // The connection form must show defaults instead of covering them with labels.
-    app.focus = Focus::Explorer;
+    app.workspace.focus = Focus::Explorer;
     app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let form = terminal
@@ -870,9 +941,10 @@ mod tests {
     );
 
     // Errors and shortcuts occupy independent full-width footer rows.
-    app.overlay = None;
-    app.status = "SQL Error [42P01]: ERROR: relation \"derp\" does not exist\nPosition: 52".into();
-    app.status_is_error = true;
+    app.workspace.overlay = None;
+    app.workspace.status =
+      "SQL Error [42P01]: ERROR: relation \"derp\" does not exist\nPosition: 52".into();
+    app.workspace.status_is_error = true;
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let error = terminal
       .backend()
@@ -885,6 +957,123 @@ mod tests {
     assert!(error.contains("Position: 52"));
     assert!(error.contains("^Q"));
     assert_eq!(status_height(&app, 120), 2);
+  }
+
+  // Both the marker and name weight distinguish connected rows without relying on color.
+  #[test]
+  fn explorer_connection_markers_and_bold_agree() {
+    let row = ExplorerRow {
+      depth: 0,
+      label: "Local".into(),
+      node: ExplorerNode::Connection("local".into()),
+    };
+    for connected in [false, true] {
+      let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+      terminal
+        .draw(|frame| {
+          frame.render_widget(
+            List::new([explorer_item(&row, "", "▸ ", connected)]),
+            frame.area(),
+          );
+        })
+        .unwrap();
+      let cells = terminal.backend().buffer().content();
+      let marker = if connected { "●" } else { "○" };
+      assert!(cells.iter().any(|cell| cell.symbol() == marker));
+      let name = cells.iter().find(|cell| cell.symbol() == "L").unwrap();
+      assert_eq!(name.modifier.contains(Modifier::BOLD), connected);
+    }
+  }
+
+  // Session identity, lifecycle shortcuts, and rollback consent stay visible at common terminal sizes.
+  #[test]
+  fn renders_session_state_and_confirmation() {
+    use crate::{
+      app::SessionAction,
+      db::{SessionState, TransactionState},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = crate::storage::Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = mpsc::channel();
+    let mut app = App::new(storage, vec![], vec![], runtime.handle().clone(), sender);
+    app.active_target = Some(("Local".into(), "postgres".into()));
+    app.workspace.focus = Focus::Sql;
+    app.workspace.session_state = SessionState::Connected(TransactionState::Open);
+    for width in [80, 120] {
+      let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+      terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+      let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+      assert!(screen.contains("SQL · Local/postgres · transaction open"));
+      assert!(screen.contains("SQL results"));
+      assert!(!screen.contains("[transaction open]"));
+      assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┌");
+      for shortcut in [
+        "F6 connect",
+        "F7 disconnect",
+        "F8 reconnect",
+        "^PgUp/Down session",
+      ] {
+        assert!(
+          screen.contains(shortcut),
+          "missing {shortcut} at width {width}"
+        );
+      }
+      for action in [
+        SessionAction::Disconnect,
+        SessionAction::Reconnect,
+        SessionAction::Quit,
+      ] {
+        app.workspace.overlay = Some(Overlay::ConfirmSession(action));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let screen = terminal
+          .backend()
+          .buffer()
+          .content()
+          .iter()
+          .map(|cell| cell.symbol())
+          .collect::<String>();
+        assert!(
+          screen.contains("rolled back"),
+          "missing rollback notice at width {width}"
+        );
+        assert!(screen.contains("Y confirm"));
+        assert!(screen.contains("N/Esc cancel"));
+      }
+      app.workspace.overlay = None;
+    }
+    // Normal sessions show only the target; exceptional states keep their diagnostics.
+    let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    for state in [
+      SessionState::Connected(TransactionState::Idle),
+      SessionState::Connected(TransactionState::Failed),
+      SessionState::Connected(TransactionState::Unknown),
+      SessionState::Disconnected,
+      SessionState::Lost,
+    ] {
+      app.workspace.session_state = state;
+      terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+      let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+      assert!(!screen.contains("autocommit"));
+      assert!(screen.contains("SQL · Local/postgres"));
+      if state != SessionState::Connected(TransactionState::Idle) {
+        assert!(screen.contains(state.label()));
+      }
+    }
   }
 
   #[test]

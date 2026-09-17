@@ -14,6 +14,7 @@ Textgres is an early-stage project. It currently supports:
 - An expandable `connection → database → schema → table` explorer.
 - Table previews with primary-key-safe row editing.
 - Multi-line SQL editing with live syntax highlighting.
+- Multiple persistent SQL sessions, with a workspace for each profile/database.
 - Saved SQL scripts.
 - Bounded result tables with measured column widths.
 
@@ -66,8 +67,61 @@ tg
 5. Use `Tab` to move between the Explorer, SQL editor, and Results.
 6. Press `F5` in the SQL editor to run SQL against the active database.
 
-Expanding a connection selects its default database as the SQL target. Selecting
-another database changes that target.
+First expanding a connection opens a persistent SQL session for its default
+database. First expanding another database opens its own session. Collapsing
+a branch leaves its sessions open.
+
+### SQL sessions and workspaces
+
+The SQL editor is shared across all targets. Changing the connection or database
+keeps the text, cursor, selection, and undo history, so you can run the same SQL
+against multiple databases. Each profile/database pair keeps its own SQL session,
+results, result selection, and operation status. Select a target again in the
+Explorer, or use `Ctrl+PageUp` / `Ctrl+PageDown` to cycle through visited workspaces. In the Explorer, `●` and bold
+text indicate a connected profile or database; `○` and regular text indicate no
+open SQL session. A profile stays marked connected while any of its database
+sessions remains open. Transaction state stays in the SQL title.
+Workspaces stay in memory until exit; save SQL scripts with `Ctrl+S` to keep them
+across launches.
+
+Expansion keeps the SQL connection open. Running SQL on a new target also opens
+its session if needed. `BEGIN`, `COMMIT`, `ROLLBACK`, temporary tables, and session
+settings therefore work across separate
+executions. Different workspaces can run operations concurrently. Each workspace
+allows one operation at a time; `Esc` cancels only that workspace's operation.
+
+- `F6`: Connect. An existing connection is kept.
+- `F7`: Disconnect the selected SQL session; keep its editor and results.
+- `F8`: Reconnect with a new connection. Temporary tables and session settings
+  are lost.
+
+After a disconnect or connection failure, SQL execution does not reconnect
+automatically, including when expanding the Explorer again. Use `F6` or `F8`.
+Failed connection attempts also require an explicit retry. A lost connection cannot restore an uncommitted transaction.
+After an uncertain write outcome, check the data before retrying.
+
+The SQL title shows the selected target, with an additional label for an open,
+failed, or unknown transaction, or a disconnected/lost session. Normal autocommit
+has no extra label. Disconnect, reconnect, and quit require confirmation
+if a transaction is open, failed, or unknown. Quit also checks running operations
+in inactive workspaces. Confirm with `Y`; `N` or `Esc` keeps working. Closing a
+connection rolls back its open transaction. To commit instead, cancel the dialog
+and execute `COMMIT` first. A failed transaction requires `ROLLBACK` or recovery
+to a valid savepoint.
+
+Explorer queries, table previews, and row edits use separate connections. **Row
+edits commit independently of the SQL editor's transaction.** Previews do not see
+its uncommitted changes or temporary tables. Use SQL in the same workspace to
+inspect or change data within that transaction. Disconnect all SQL sessions for a
+profile and finish its operations before editing or deleting the profile.
+
+Transaction state is read from `pg_catalog.pg_stat_activity` through a short-lived
+observer connection after SQL operations. This avoids adding statements to the
+user's transaction, including a failed transaction. If observation fails or
+activity tracking is disabled, the UI reports unknown state and requires
+confirmation before closing. Allow capacity for these additional connections.
+Persistent session features require a direct PostgreSQL connection or a proxy
+that preserves backend affinity; transaction pooling cannot provide that guarantee.
 
 ## Connections
 
@@ -110,6 +164,8 @@ The bottom bar shows controls for the active pane or dialog. `^` means `Ctrl`.
 | --- | --- | --- |
 | Global | `Tab` / `Shift+Tab` | Select the next or previous pane |
 | Global | `Ctrl+Q` | Quit |
+| Global | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous or next visited workspace |
+| Global | `F6` / `F7` / `F8` | Connect / disconnect / reconnect selected SQL session |
 | Database operation | `Esc` | Cancel the current database operation |
 | Explorer | `↑` / `↓`, `j` / `k` | Move selection |
 | Explorer | `Home` / `End`, `g` / `G` | Select the first or last item |
@@ -156,9 +212,13 @@ only the configured identity-file path is saved.
 
 ## Behavior and safety
 
-- Executed SQL, preview `SELECT` statements, and row updates time out after 30 seconds.
+- Connections start with a 30-second statement timeout. SQL sessions can change
+  their own timeout with `SET statement_timeout`; previews and row edits keep the
+  default timeout.
 - Custom SQL results keep at most 500 rows.
 - Table previews keep at most 200 rows.
+- Table and view previews show `Results · schema.object` in the pane title.
+  Free-form SQL uses `SQL results` because it may have no single source object.
 - Direct table previews are editable only when the table has a primary key.
 - Saving or deleting a connection clears its table preview and row edits. Load
   the table again after a connection change before editing rows.
@@ -177,8 +237,10 @@ retrying a write with an unknown outcome.
 
 Cancellation does not undo earlier committed statements. If a row update has
 already committed and only its preview refresh is cancelled, Textgres reports
-`Row saved; refresh cancelled`. Normal exit also requests cancellation and waits
-for the worker to finish.
+`Row saved; refresh cancelled`. A cancelled statement inside an explicit transaction
+usually leaves it failed; execute `ROLLBACK` before continuing. Normal exit requests
+cancellation for every running workspace, waits for their outcomes, then closes
+all SQL connections.
 
 The 500-row limit bounds displayed data. Textgres continues reading the response
 to receive later errors and determine whether the query completed.
@@ -213,5 +275,14 @@ cargo test postgres_ -- --ignored --test-threads=1
 
 These tests use temporary directories and local ports. They do not connect to
 saved profiles or existing databases.
+
+Session tests cover transaction persistence and recovery, metadata isolation,
+concurrent databases, cancellation, timeout, connection loss, reconnect, and
+application shutdown. UI tests cover workspace ownership, background responses,
+draft and undo preservation, profile changes, and transaction confirmation.
+
+Session ownership is in `src/db/sessions.rs`. Workspace state and result handling
+are in `src/app/workspace.rs`; switching and lifecycle actions are in
+`src/app/sessions.rs`.
 
 Textgres is licensed under [GPL-3.0-only](LICENSE).

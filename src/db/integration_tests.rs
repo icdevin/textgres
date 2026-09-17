@@ -84,7 +84,6 @@ impl TestDatabase {
   fn query(&self, sql: &str) -> (Task, Receiver<Response>) {
     self.dispatch(Request::Query {
       profile: self.profile.clone(),
-      password: None,
       database: "postgres".into(),
       sql: sql.into(),
     })
@@ -96,6 +95,7 @@ impl TestDatabase {
       &Handle::current(),
       sender,
       TunnelManager::default(),
+      SessionManager::default(),
       1,
       request,
     );
@@ -541,6 +541,7 @@ async fn postgres_cancellation_preserves_tls_and_routed_endpoint() {
     driver,
     tls,
     cancellation: cancellation.clone(),
+    broken: AtomicBool::new(false),
   };
   let encrypted: bool = client
     .client
@@ -625,3 +626,6 @@ async fn postgres_cancelled_row_update_preserves_values() {
     .get(0);
   assert_eq!(value, "before");
 }
+
+// Persistent-session regressions share the isolated cluster fixture.
+mod sessions;

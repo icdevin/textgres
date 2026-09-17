@@ -28,6 +28,10 @@ use tokio_postgres::{
 
 use crate::storage::{ConnectionProfile, SshConfig};
 
+// SQL sessions own connections independently of per-operation workers.
+mod sessions;
+pub use sessions::{SessionManager, SessionState, TransactionState};
+
 const MAX_RESULT_ROWS: usize = 500;
 // A lost cancellation connection must not leave the terminal busy indefinitely.
 const CANCELLATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,9 +72,19 @@ pub struct QueryResult {
   pub source: Option<TableResultSource>,
 }
 
-/// Each request is self-contained so no connection can outlive its owning task.
+// Requests carry a fixed target; SQL connections are owned by the session manager.
 #[derive(Clone, Debug)]
 pub enum Request {
+  // Lifecycle actions never silently replace a lost SQL session.
+  Connect {
+    profile: ConnectionProfile,
+    database: String,
+    reconnect: bool,
+  },
+  Disconnect {
+    profile: ConnectionProfile,
+    database: String,
+  },
   Databases {
     profile: ConnectionProfile,
     password: Option<String>,
@@ -93,7 +107,6 @@ pub enum Request {
   },
   Query {
     profile: ConnectionProfile,
-    password: Option<String>,
     database: String,
     sql: String,
   },
@@ -109,6 +122,7 @@ pub enum Request {
 /// Typed output prevents the UI from accepting a response for the wrong node.
 #[derive(Debug)]
 pub enum Output {
+  Session,
   Databases {
     profile_id: String,
     names: Vec<String>,
@@ -132,6 +146,7 @@ pub enum Output {
 /// An operation ID keeps responses associated with the worker that owns them.
 #[derive(Debug)]
 pub struct Response {
+  pub session_state: Option<SessionState>,
   pub operation_id: u64,
   pub result: anyhow::Result<Output>,
 }
@@ -208,6 +223,7 @@ struct DatabaseConnection {
   driver: JoinHandle<()>,
   tls: MakeTlsConnector,
   cancellation: Arc<Cancellation>,
+  broken: AtomicBool,
 }
 
 impl Drop for DatabaseConnection {
@@ -245,6 +261,7 @@ impl DatabaseConnection {
           Ok(result) => result,
           Err(_) => {
             let detail = cancel_error.map_or_else(String::new, |error| format!("; cancel request failed: {error}"));
+            self.broken.store(true, Ordering::SeqCst);
             anyhow::bail!("Cancellation was not confirmed within 5 seconds; write outcome is unknown{detail}");
           }
         }
@@ -259,9 +276,11 @@ impl DatabaseConnection {
       }
       Err(error) => {
         let Some(database_error) = error.as_db_error() else {
+          self.broken.store(true, Ordering::SeqCst);
           return Err(error).context("Database connection failed; write outcome is unknown");
         };
         if matches!(database_error.severity(), "FATAL" | "PANIC") {
+          self.broken.store(true, Ordering::SeqCst);
           // A server disconnect can arrive after a commit but before its acknowledgement.
           anyhow::bail!(
             "Database connection failed; write outcome is unknown: {}",
@@ -547,13 +566,16 @@ pub fn spawn(
   runtime: &Handle,
   sender: Sender<Response>,
   tunnels: TunnelManager,
+  sessions: SessionManager,
   operation_id: u64,
   request: Request,
 ) -> Task {
   let cancellation = Arc::new(Cancellation::default());
   let worker_cancellation = cancellation.clone();
   let worker = runtime.spawn(async move {
-    let result = execute(request, &tunnels, &worker_cancellation).await;
+    let (result, session_state) = sessions
+      .execute(request, &tunnels, &worker_cancellation)
+      .await;
     // The terminal receiver closes on exit; still report an uncertain write to the caller.
     let shutdown_result = match &result {
       Err(error) if !error.is::<Cancelled>() => Err(anyhow::anyhow!(format_error(error))),
@@ -561,6 +583,7 @@ pub fn spawn(
     };
     // The receiver can disappear during normal application shutdown.
     let _ = sender.send(Response {
+      session_state,
       operation_id,
       result,
     });
@@ -579,6 +602,9 @@ async fn execute(
   cancelled: &Arc<Cancellation>,
 ) -> anyhow::Result<Output> {
   match request {
+    Request::Connect { .. } | Request::Disconnect { .. } | Request::Query { .. } => {
+      anyhow::bail!("session lifecycle requests require a session manager")
+    }
     Request::Databases { profile, password } => {
       let profile_id = profile.id.clone();
       let client = connect(
@@ -673,15 +699,6 @@ async fn execute(
       )
       .await?;
       Ok(Output::Result(preview_table(&client, table).await?))
-    }
-    Request::Query {
-      profile,
-      password,
-      database,
-      sql,
-    } => {
-      let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
-      Ok(Output::Result(run_query(&client, &sql).await?))
     }
     Request::UpdateRow {
       profile,
@@ -882,6 +899,8 @@ async fn connect_inner(
     .dbname(database)
     .user(&profile.user)
     .application_name("textgres")
+    // Set the default at startup so ROLLBACK still works in an aborted transaction.
+    .options("-c statement_timeout=30000")
     .connect_timeout(Duration::from_secs(10))
     .ssl_mode(if profile.require_tls {
       SslMode::Require
@@ -915,13 +934,11 @@ async fn connect_inner(
     driver,
     tls,
     cancellation: cancelled.clone(),
+    broken: AtomicBool::new(false),
   })
 }
 
 async fn run_query(client: &DatabaseConnection, sql: &str) -> anyhow::Result<QueryResult> {
-  client
-    .run(client.client.batch_execute("SET statement_timeout = '30s'"))
-    .await?;
   // Keep reading through ReadyForQuery so late errors and cancellation are observed.
   client
     .run(async {

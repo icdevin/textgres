@@ -73,6 +73,8 @@ fn run(
       app.handle_database_response(response);
       dirty = true;
     }
+    // Surface idle connection loss without requiring another query or keypress.
+    dirty |= app.poll_sessions();
 
     // Avoid redrawing an unchanged terminal while still polling worker responses.
     if dirty {
