@@ -121,7 +121,7 @@ async fn sleeping_backend(observer: &DatabaseConnection, sql: &str) -> i32 {
   tokio::time::timeout(Duration::from_secs(5), async {
     loop {
       let rows = observer.client.query(
-        "SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query = $1 AND state = 'active' AND wait_event = 'PgSleep'",
+        "SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (query = $1 OR query LIKE 'FETCH FORWARD 200 FROM \"textgres_result_%') AND state = 'active' AND wait_event = 'PgSleep'",
         &[&sql],
       ).await.unwrap();
       if let Some(row) = rows.first() {
@@ -425,12 +425,14 @@ async fn postgres_cancelled_refresh_reports_the_saved_row() {
   let preview = preview_table(&observer, table).await.unwrap();
   let mut profile = database.profile.clone();
   profile.user = "preview_user".into();
-  let (task, receiver) = database.dispatch(Request::UpdateRow {
+  let (task, receiver) = database.dispatch(Request::SaveChanges {
     profile,
     password: None,
     source: preview.source.unwrap(),
-    original: preview.rows[0].clone(),
-    values: vec![Some("1".into()), Some("after".into())],
+    changes: vec![RowChange::Update {
+      original: preview.rows[0].clone(),
+      values: vec![Some("1".into()), Some("after".into())],
+    }],
   });
   let pid = sleeping_backend(
     &observer,
@@ -438,7 +440,7 @@ async fn postgres_cancelled_refresh_reports_the_saved_row() {
   )
   .await;
   task.cancel();
-  let Output::Updated(refresh) = response(&receiver).await.unwrap() else {
+  let Output::Saved(refresh) = response(&receiver).await.unwrap() else {
     panic!("committed update must remain successful");
   };
   assert!(refresh.unwrap_err().is::<Cancelled>());
@@ -607,12 +609,11 @@ async fn postgres_cancelled_row_update_preserves_values() {
   let original = preview.rows[0].clone();
   let values = vec![Some("1".into()), Some("after".into())];
   let (sql, _) = build_update(&source, &original, &values).unwrap();
-  let (task, receiver) = database.dispatch(Request::UpdateRow {
+  let (task, receiver) = database.dispatch(Request::SaveChanges {
     profile: database.profile.clone(),
     password: None,
     source,
-    original,
-    values,
+    changes: vec![RowChange::Update { original, values }],
   });
   let pid = sleeping_backend(&observer, &sql).await;
   task.cancel();
@@ -629,3 +630,9 @@ async fn postgres_cancelled_row_update_preserves_values() {
 
 // Persistent-session regressions share the isolated cluster fixture.
 mod sessions;
+
+// Batch-write regressions share the disposable PostgreSQL fixture.
+mod changes;
+
+// Cursor tests verify bounded fetching and retained transaction ownership.
+mod paging;

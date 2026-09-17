@@ -1950,6 +1950,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "toml",
+ "tree-sitter",
  "tree-sitter-highlight",
  "tree-sitter-sequel",
  "unicode-width",

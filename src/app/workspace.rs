@@ -12,8 +12,12 @@ pub struct Workspace {
   pub status: String,
   pub status_is_error: bool,
   pub session_state: db::SessionState,
-  pub(super) pending_row_edit: Option<RowDetail>,
+  pub edits: table_edits::TableEdits,
+  // Preserve the refresh target if a committed batch loses its follow-up preview.
+  pub(super) refresh_table: Option<TableRef>,
   pub(super) database_task: Option<db::Task>,
+  // A failed FETCH cannot be retried because the server may already have advanced its cursor.
+  pub(super) fetching_page: bool,
 }
 
 impl Default for Workspace {
@@ -29,8 +33,10 @@ impl Default for Workspace {
       status: "Ready".into(),
       status_is_error: false,
       session_state: db::SessionState::Disconnected,
-      pending_row_edit: None,
+      edits: table_edits::TableEdits::default(),
+      refresh_table: None,
       database_task: None,
+      fetching_page: false,
     }
   }
 }
@@ -48,10 +54,43 @@ impl Workspace {
     }
     self.database_task = None;
     self.busy = None;
+    let fetched_page = std::mem::take(&mut self.fetching_page);
     if let Some(state) = response.session_state {
       self.session_state = state;
+      // Closing a SQL connection also closes its result cursor; independent table previews survive.
+      if matches!(
+        state,
+        db::SessionState::Disconnected | db::SessionState::Lost
+      ) && self.result.page.as_ref().is_some_and(|page| !page.preview)
+      {
+        self.result.page = None;
+      }
     }
     match response.result {
+      Ok(Output::Page { requested, result }) => {
+        // Operation IDs and cursor IDs together protect results from stale or misrouted pages.
+        if self.result.page.as_ref() != Some(&requested) || self.result.columns != result.columns {
+          self.result.page = None;
+          self.set_status(
+            "Result page no longer matches; refresh or run the query again".into(),
+            true,
+          );
+          return;
+        }
+        let added = result.rows.len();
+        self
+          .edits
+          .append_page(&mut self.result, result.rows, &mut self.result_row);
+        self.result.page = result.page;
+        self.result.status = db::page_status(
+          self.result.rows.len() - self.edits.new_defaults.len(),
+          self.result.page.is_some(),
+        );
+        self.set_status(
+          format!("Loaded {added} more rows; {}", self.result.status),
+          false,
+        );
+      }
       Ok(Output::Session) => self.set_status(self.session_state.label().into(), false),
       Ok(Output::Databases { names, .. }) => {
         let count = names.len();
@@ -67,20 +106,22 @@ impl Workspace {
       }
       Ok(Output::Result(result)) => {
         let status = result.status.clone();
+        self.refresh_table = result.source.as_ref().map(|source| source.table.clone());
+        self.edits = table_edits::TableEdits::default();
         self.result = result;
         self.result_row = 0;
         self.result_column = 0;
         self.focus = Focus::Results;
         self.set_status(status, false);
       }
-      Ok(Output::Updated(result)) => {
-        self.pending_row_edit = None;
+      Ok(Output::Saved(result)) => {
+        self.edits = table_edits::TableEdits::default();
         self.result_row = 0;
         self.result_column = 0;
         self.focus = Focus::Results;
         match result {
           Ok(result) => {
-            let status = format!("Row saved; {}", result.status);
+            let status = format!("Changes saved; {}", result.status);
             self.result = result;
             self.set_status(status, false);
           }
@@ -88,10 +129,13 @@ impl Workspace {
             // Old row values must not remain editable after a committed write.
             self.result = QueryResult::default();
             if error.is::<db::Cancelled>() {
-              self.set_status("Row saved; refresh cancelled".into(), false);
+              self.set_status("Changes saved; refresh cancelled".into(), false);
             } else {
               self.set_status(
-                format!("Row saved; refresh failed: {}", db::format_error(&error)),
+                format!(
+                  "Changes saved; refresh failed: {}",
+                  db::format_error(&error)
+                ),
                 true,
               );
             }
@@ -99,8 +143,20 @@ impl Workspace {
         }
       }
       Err(error) => {
-        if let Some(form) = self.pending_row_edit.take() {
-          self.overlay = Some(Overlay::RowDetail(Box::new(form)));
+        if fetched_page {
+          self.result.page = None;
+          self.set_status(
+            format!(
+              "Page fetch failed; loaded rows retained. Refresh or run the query again: {}",
+              db::format_error(&error)
+            ),
+            true,
+          );
+          return;
+        }
+        // Keep failed batches staged, but never offer a blind retry after an uncertain COMMIT.
+        if error.is::<db::UnknownCommit>() {
+          self.edits.uncertain = true;
         }
         if error.is::<db::Cancelled>() {
           self.set_status(error.to_string(), false);
@@ -119,16 +175,17 @@ impl Workspace {
         .is_some_and(|source| source.table.profile_id == profile_id)
     };
     if from_profile(&self.result.source) {
+      self.edits = table_edits::TableEdits::default();
       self.result = QueryResult::default();
       self.result_row = 0;
       self.result_column = 0;
     }
     if self
-      .pending_row_edit
+      .refresh_table
       .as_ref()
-      .is_some_and(|form| from_profile(&form.source))
+      .is_some_and(|table| table.profile_id == profile_id)
     {
-      self.pending_row_edit = None;
+      self.refresh_table = None;
     }
     if matches!(&self.overlay, Some(Overlay::RowDetail(form)) if from_profile(&form.source)) {
       self.overlay = None;

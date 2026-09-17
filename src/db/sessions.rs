@@ -6,6 +6,8 @@ use tokio::sync::Mutex as AsyncMutex;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionState {
   Idle,
+  // A read-only cursor transaction is owned by tg and closes before the next SQL command.
+  Paging,
   Open,
   Failed,
   Unknown,
@@ -26,6 +28,7 @@ impl SessionState {
     match self {
       Self::Disconnected => "disconnected",
       Self::Connected(TransactionState::Idle) => "autocommit",
+      Self::Connected(TransactionState::Paging) => "result cursor open",
       Self::Connected(TransactionState::Open) => "transaction open",
       Self::Connected(TransactionState::Failed) => "transaction failed · ROLLBACK required",
       Self::Connected(TransactionState::Unknown) => "transaction state unknown",
@@ -48,6 +51,7 @@ impl SessionState {
 #[derive(Clone, Default)]
 pub struct SessionManager {
   entries: Arc<Mutex<SessionEntries>>,
+  previews: paging::Previews,
 }
 
 // Each entry serializes only its own connection, not work on other databases.
@@ -59,6 +63,7 @@ struct Session {
   connection: Option<DatabaseConnection>,
   pid: i32,
   state: SessionState,
+  cursor: Option<paging::Cursor>,
 }
 
 impl Session {
@@ -68,6 +73,7 @@ impl Session {
       connection.client.is_closed() || connection.broken.load(Ordering::SeqCst)
     }) {
       self.connection = None;
+      self.cursor = None;
       self.state = SessionState::Lost;
     }
   }
@@ -107,6 +113,7 @@ impl SessionManager {
       );
     }
     entries.retain(|(id, _), _| id != profile_id);
+    self.previews.clear(Some(profile_id));
     Ok(())
   }
 
@@ -117,6 +124,7 @@ impl SessionManager {
       .lock()
       .unwrap_or_else(|error| error.into_inner())
       .clear();
+    self.previews.clear(None);
   }
 
   // Expansion establishes the SQL session; metadata still uses a separate connection.
@@ -126,7 +134,87 @@ impl SessionManager {
     tunnels: &TunnelManager,
     cancellation: &Arc<Cancellation>,
   ) -> (anyhow::Result<Output>, Option<SessionState>) {
+    // Table cursors have their own connections and never borrow the SQL session transaction.
+    match &request {
+      Request::Preview {
+        profile,
+        password,
+        table,
+      } => {
+        if let Err(error) = self
+          .close_result_cursor(&table.profile_id, &table.database)
+          .await
+        {
+          return (Err(error), None);
+        }
+        return (
+          self
+            .previews
+            .start(
+              profile,
+              password.as_deref(),
+              table.clone(),
+              tunnels,
+              cancellation,
+            )
+            .await
+            .map(Output::Result),
+          None,
+        );
+      }
+      Request::SaveChanges {
+        profile,
+        password,
+        source,
+        changes,
+      } => {
+        self
+          .previews
+          .remove(&source.table.profile_id, &source.table.database);
+        // Preserve the committed outcome even if opening its fresh cursor fails.
+        let result = async {
+          self
+            .close_result_cursor(&source.table.profile_id, &source.table.database)
+            .await?;
+          let connection = connect(
+            profile,
+            password.as_deref(),
+            &source.table.database,
+            tunnels,
+            cancellation,
+          )
+          .await?;
+          changes::save(&connection, source, changes).await?;
+          Ok(Output::Saved(
+            self
+              .previews
+              .start_connected(connection, source.table.clone())
+              .await,
+          ))
+        }
+        .await;
+        return (result, None);
+      }
+      Request::FetchPage { page } if page.preview => {
+        return (
+          self
+            .previews
+            .fetch(page, cancellation)
+            .await
+            .map(|result| Output::Page {
+              requested: page.clone(),
+              result,
+            }),
+          None,
+        );
+      }
+      Request::Query {
+        profile, database, ..
+      } => self.previews.remove(&profile.id, database),
+      _ => {}
+    }
     let (profile_id, database) = match &request {
+      Request::FetchPage { page } => (page.profile_id.clone(), page.database.clone()),
       Request::Query {
         profile, database, ..
       }
@@ -151,6 +239,14 @@ impl SessionManager {
       if let Some(entry) = entries.get(&key) {
         (entry.clone(), false)
       } else {
+        if matches!(request, Request::FetchPage { .. }) {
+          return (
+            Err(anyhow::anyhow!(
+              "SQL result cursor is closed; run the query again"
+            )),
+            None,
+          );
+        }
         let profile = match &request {
           Request::Query { profile, .. }
           | Request::Connect { profile, .. }
@@ -164,6 +260,7 @@ impl SessionManager {
           connection: None,
           pid: 0,
           state: SessionState::Disconnected,
+          cursor: None,
         }));
         entries.insert(key, entry.clone());
         // A first query may connect lazily, but subsequent failures require explicit reconnect.
@@ -171,6 +268,33 @@ impl SessionManager {
       }
     };
     Self::run(entry, request, &database, tunnels, cancellation, first).await
+  }
+
+  // Replacing SQL results with a table preview releases only tg's cursor, never user work.
+  async fn close_result_cursor(&self, profile_id: &str, database: &str) -> anyhow::Result<()> {
+    let entry = self
+      .entries
+      .lock()
+      .unwrap_or_else(|error| error.into_inner())
+      .get(&(profile_id.into(), database.into()))
+      .cloned();
+    if let Some(entry) = entry {
+      let mut session = entry
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("Wait for the SQL session's operation to finish"))?;
+      session.check_health();
+      if let Some(cursor) = session.cursor.take()
+        && let Some(connection) = &session.connection
+      {
+        let result = cursor.close(connection).await;
+        session.check_health();
+        result?;
+        if cursor.owns_transaction {
+          session.state = SessionState::Connected(TransactionState::Idle);
+        }
+      }
+    }
+    Ok(())
   }
 
   // Holding only this session's lock permits other databases to execute concurrently.
@@ -194,9 +318,33 @@ impl SessionManager {
     let result = async {
       ensure_not_cancelled(&cancellation.requested)?;
       if let Request::Disconnect { .. } = request {
+        session.cursor = None;
         session.connection = None;
         session.state = SessionState::Disconnected;
         return Ok(Output::Session);
+      }
+      if let Request::FetchPage { page } = &request {
+        let Some(cursor) = session.cursor.take() else {
+          anyhow::bail!("SQL result cursor is closed; run the query again");
+        };
+        if cursor.page != *page {
+          session.cursor = Some(cursor);
+          anyhow::bail!("SQL result cursor was replaced; run the query again");
+        }
+        let connection = session
+          .connection
+          .as_mut()
+          .ok_or_else(|| anyhow::anyhow!("SQL session lost; reconnect and run the query again"))?;
+        connection.cancellation = cancellation.clone();
+        let fetched = cursor.fetch(connection).await;
+        let result = cursor.finish(connection, fetched).await;
+        if result.as_ref().is_ok_and(|result| result.page.is_some()) {
+          session.cursor = Some(cursor);
+        }
+        return result.map(|result| Output::Page {
+          requested: page.clone(),
+          result,
+        });
       }
       let (profile, explicit, reconnect) = match &request {
         Request::Query { profile, .. }
@@ -212,6 +360,7 @@ impl SessionManager {
         "Connection settings changed; disconnect and reopen the session"
       );
       if reconnect {
+        session.cursor = None;
         session.connection = None;
         session.state = SessionState::Disconnected;
       }
@@ -235,6 +384,21 @@ impl SessionManager {
         session.connection = Some(connection);
         session.state = SessionState::Connected(TransactionState::Idle);
       }
+      // Close our earlier cursor before user SQL, including BEGIN/COMMIT/ROLLBACK.
+      if matches!(request, Request::Query { .. })
+        && let Some(cursor) = session.cursor.take()
+      {
+        let connection = session
+          .connection
+          .as_mut()
+          .expect("connection was just established");
+        connection.cancellation = cancellation.clone();
+        cursor.close(connection).await?;
+        if cursor.owns_transaction {
+          session.state = SessionState::Connected(TransactionState::Idle);
+        }
+      }
+      let state = session.state;
       let connection = session
         .connection
         .as_mut()
@@ -242,7 +406,37 @@ impl SessionManager {
       // Cancellation applies to one operation, not all later work in the same session.
       connection.cancellation = cancellation.clone();
       match request {
-        Request::Query { sql, .. } => Ok(Output::Result(run_query(connection, &sql).await?)),
+        Request::Query { sql, profile, .. } => {
+          // Unknown/failed transactions retain the original execution path; never guess ownership.
+          let statement = if matches!(
+            state,
+            SessionState::Connected(TransactionState::Idle | TransactionState::Open)
+          ) {
+            paging::select_statement(&sql)
+          } else {
+            None
+          };
+          if let Some(statement) = statement {
+            let cursor = paging::Cursor::new(
+              &profile.id,
+              database,
+              false,
+              state == SessionState::Connected(TransactionState::Idle),
+            );
+            let result = async {
+              cursor.open(connection, &statement).await?;
+              cursor.fetch(connection).await
+            }
+            .await;
+            let result = cursor.finish(connection, result).await;
+            if result.as_ref().is_ok_and(|result| result.page.is_some()) {
+              session.cursor = Some(cursor);
+            }
+            Ok(Output::Result(result?))
+          } else {
+            Ok(Output::Result(run_query(connection, &sql).await?))
+          }
+        }
         // Browsing must work even when the retained SQL connection has a failed transaction.
         Request::Databases { .. } | Request::Schemas { .. } => {
           super::execute(request, tunnels, cancellation).await
@@ -255,7 +449,18 @@ impl SessionManager {
     if session.connection.is_some() {
       // Do not issue probes in the SQL connection: an aborted transaction must remain untouched.
       let state = observe_transaction(&session.profile, database, session.pid, tunnels).await;
-      session.state = SessionState::Connected(state);
+      session.state = SessionState::Connected(
+        if state == TransactionState::Open
+          && session
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.owns_transaction)
+        {
+          TransactionState::Paging
+        } else {
+          state
+        },
+      );
       session.check_health();
     }
     (result, Some(session.state))

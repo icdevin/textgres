@@ -12,11 +12,11 @@ Textgres is an early-stage project. It currently supports:
 - Saved PostgreSQL connection profiles and passwords.
 - Optional persistent SSH connections through the local OpenSSH client.
 - An expandable `connection → database → schema → table` explorer.
-- Table previews with primary-key-safe row editing.
+- Table previews with staged inserts, updates, and deletes saved as one batch.
 - Multi-line SQL editing with live syntax highlighting.
 - Multiple persistent SQL sessions, with a workspace for each profile/database.
 - Saved SQL scripts.
-- Bounded result tables with measured column widths.
+- Result tables with 200-row pages, row numbers, and measured column widths.
 
 ## Requirements
 
@@ -63,7 +63,7 @@ tg
 1. Press `n` in the Explorer to create a connection.
 2. Enter the PostgreSQL settings. Use `Tab` to change fields and `Ctrl+S` to save.
 3. Press `Enter` on the connection, database, and schema to expand them.
-4. Press `Enter` on a table to load its first 200 rows.
+4. Press `Enter` on a table to load its first 200 rows. Scroll to the bottom to load more.
 5. Use `Tab` to move between the Explorer, SQL editor, and Results.
 6. Press `F5` in the SQL editor to run SQL against the active database.
 
@@ -104,16 +104,17 @@ The SQL title shows the selected target, with an additional label for an open,
 failed, or unknown transaction, or a disconnected/lost session. Normal autocommit
 has no extra label. Disconnect, reconnect, and quit require confirmation
 if a transaction is open, failed, or unknown. Quit also checks running operations
-in inactive workspaces. Confirm with `Y`; `N` or `Esc` keeps working. Closing a
+and pending table changes in inactive workspaces. Confirm with `Y`; `N` or `Esc` keeps working. Closing a
 connection rolls back its open transaction. To commit instead, cancel the dialog
 and execute `COMMIT` first. A failed transaction requires `ROLLBACK` or recovery
 to a valid savepoint.
 
-Explorer queries, table previews, and row edits use separate connections. **Row
-edits commit independently of the SQL editor's transaction.** Previews do not see
+Explorer queries, table previews, and batch saves use separate connections. **Table
+batches commit independently of the SQL editor's transaction.** Previews do not see
 its uncommitted changes or temporary tables. Use SQL in the same workspace to
 inspect or change data within that transaction. Disconnect all SQL sessions for a
-profile and finish its operations before editing or deleting the profile.
+profile, finish its operations, and save or discard pending table changes before
+editing or deleting the profile.
 
 Transaction state is read from `pg_catalog.pg_stat_activity` through a short-lived
 observer connection after SQL operations. This avoids adding statements to the
@@ -122,6 +123,65 @@ activity tracking is disabled, the UI reports unknown state and requires
 confirmation before closing. Allow capacity for these additional connections.
 Persistent session features require a direct PostgreSQL connection or a proxy
 that preserves backend affinity; transaction pooling cannot provide that guarantee.
+
+### Table changes
+
+In Results, press `Insert` or `n` to add a row, `Delete` or `d` to mark a row
+for deletion, and `Enter` or `e` to open a row for editing. New rows are green,
+deleted rows are red, and modified cells are yellow. `Delete` again restores a
+marked row; deleting a new row removes the pending insert.
+
+In the row editor, press `Enter` to edit a field and `Ctrl+S` to stage its row
+and close the editor. This does not write to PostgreSQL. New rows start with
+`DEFAULT` for every column. `Ctrl+N` chooses explicit `NULL`; `Ctrl+D` restores
+`DEFAULT` on a new row. Generated columns always use their database defaults.
+
+Back in Results, `Ctrl+S` saves all pending changes for that table in one
+transaction and reloads the preview. `Ctrl+Z` discards the whole local batch.
+A validation error, constraint failure, or row conflict rolls back the batch
+and preserves the staged values for correction. If the commit response is lost,
+editing and retrying are blocked until you refresh and check what was saved.
+
+`F5` reloads the current table or view. Pending changes require confirmation;
+they are discarded only after a successful refresh. This shortcut does not rerun
+custom SQL results, since the SQL could write data. Run that SQL explicitly from
+the SQL editor instead.
+
+Each workspace retains its pending batch when you switch databases. Save or
+discard it before loading another table or replacing its results with SQL.
+Pending changes exist only in memory; quitting asks for confirmation before
+discarding them.
+
+### Result paging
+
+Table previews and supported single `SELECT` statements fetch 200 rows at a time.
+Move to the last loaded row with `Down`, `j`, `PageDown`, or `End` to request the
+next page. `End` loads one page, not the entire result. Fetched rows stay available
+when you scroll back. The title shows `200+ rows` while another page may exist;
+an exact multiple of 200 needs one final empty fetch to detect completion.
+
+The untitled column on the left shows tg's result row number, starting at 1 and continuing
+across pages. It is not a database column or row identifier. Numbers describe the
+current displayed order and can change after refresh or removal of a new row.
+
+Pages come from one server cursor and snapshot. The query is not rerun for each
+page, so concurrent writes do not shift or duplicate rows between pages. Pending
+table edits survive page loads. A failed or cancelled fetch keeps the loaded
+rows but closes further paging; refresh the table or run the query again.
+
+Outside an explicit SQL transaction, paged reads use a temporary read-only
+transaction on the same SQL connection.
+It closes when the results finish, are replaced, or the connection closes.
+This retains a database snapshot and locks while browsing. Inside an explicit
+transaction, paging uses that transaction and never commits or rolls it back.
+Functions that change data or session settings should be executed in an explicit
+transaction or script rather than used as an autocommit preview.
+
+Writes, locking reads, `SELECT INTO`, data-modifying CTEs, multi-statement scripts,
+and SQL the bundled parser cannot classify keep their original execution path.
+They run to completion, with at most 500 result rows retained. Paging limits
+transfer and fetching; PostgreSQL may still need to scan or sort substantial data
+before it can return the first page.
 
 ## Connections
 
@@ -178,13 +238,20 @@ The bottom bar shows controls for the active pane or dialog. `^` means `Ctrl`.
 | SQL | `Ctrl+L` | Load a saved script |
 | SQL | `Ctrl+Up` / `Ctrl+Down` | Resize the SQL editor |
 | Results | `↑` / `↓`, `j` / `k` | Move through rows |
+| Results | `PageUp` / `PageDown` | Move 20 rows; fetch another page at the bottom |
 | Results | `←` / `→`, `h` / `l` | Scroll through columns |
-| Results | `Home` / `End`, `g` / `G` | Select the first or last row |
-| Results | `Enter` | Open the selected row |
+| Results | `Home` / `End`, `g` / `G` | Select the first or last loaded row; fetch at the bottom |
+| Results | `Enter` / `e` | Open the selected row for viewing or editing |
+| Results | `Insert` / `n` | Add a row with database defaults |
+| Results | `Delete` / `d` | Toggle deletion; remove a pending new row |
+| Results | `Ctrl+S` | Save all pending table changes |
+| Results | `Ctrl+Z` | Discard all pending table changes |
+| Results | `F5` | Refresh the table or view preview |
 | Row viewer | `↑` / `↓`, `j` / `k` | Select a field |
 | Row viewer | `Enter` | Edit an editable field |
 | Row viewer | `Ctrl+N` | Toggle the selected value between text and `NULL` |
-| Row viewer | `Ctrl+S` | Save changes and refresh the table preview |
+| Row viewer | `Ctrl+D` | Restore the selected field to `DEFAULT` on a new row |
+| Row viewer | `Ctrl+S` | Stage this row and close; no database write |
 | Row viewer | `Esc` | Finish field editing or close the viewer |
 
 Connection forms use `Tab`, `Enter`, or `Down` for the next field and
@@ -215,18 +282,20 @@ only the configured identity-file path is saved.
 - Connections start with a 30-second statement timeout. SQL sessions can change
   their own timeout with `SET statement_timeout`; previews and row edits keep the
   default timeout.
-- Custom SQL results keep at most 500 rows.
-- Table previews keep at most 200 rows.
+- Paged reads start with 200 rows and fetch more on demand. Memory grows with
+  fetched pages. Other SQL keeps at most 500 displayed rows while completing execution.
 - Table and view previews show `Results · schema.object` in the pane title.
   Free-form SQL uses `SQL results` because it may have no single source object.
-- Direct table previews are editable only when the table has a primary key.
-- Saving or deleting a connection clears its table preview and row edits. Load
+- Existing rows can be modified or deleted only when the table has a primary key.
+  Base tables without a primary key still allow inserts.
+- Saving or deleting a connection clears its table preview. Load
   the table again after a connection change before editing rows.
-- Generated columns, views, tables without primary keys, and custom SQL results are
-  read-only in the row viewer.
+- Generated columns, views, and custom SQL results are read-only in the row viewer.
+  Identity-always columns use their defaults on insertion.
 - Row updates use typed parameters and match the original key and edited values.
-  A conflicting concurrent change causes the update to fail instead of being
-  overwritten.
+  Deletes match the entire original row. A conflicting concurrent change rolls
+  back the batch instead of being overwritten. Batches apply deletes, updates,
+  then inserts; constraint checks can reject changes that depend on another order.
 - Custom SQL is unrestricted and can modify or delete data.
 
 Press `Esc` to request cancellation. Textgres displays `Cancelling…` and waits
@@ -235,15 +304,15 @@ If cancellation cannot be confirmed within five seconds, Textgres closes the
 connection and reports that the write outcome is unknown. Check the data before
 retrying a write with an unknown outcome.
 
-Cancellation does not undo earlier committed statements. If a row update has
+Cancellation does not undo earlier committed statements. If a table batch has
 already committed and only its preview refresh is cancelled, Textgres reports
-`Row saved; refresh cancelled`. A cancelled statement inside an explicit transaction
+`Changes saved; refresh cancelled`. A cancelled statement inside an explicit transaction
 usually leaves it failed; execute `ROLLBACK` before continuing. Normal exit requests
 cancellation for every running workspace, waits for their outcomes, then closes
 all SQL connections.
 
-The 500-row limit bounds displayed data. Textgres continues reading the response
-to receive later errors and determine whether the query completed.
+For SQL that does not use paging, the 500-row display limit still drains the
+response to receive later errors and determine whether execution completed.
 
 ## SSH troubleshooting
 
@@ -280,9 +349,17 @@ Session tests cover transaction persistence and recovery, metadata isolation,
 concurrent databases, cancellation, timeout, connection loss, reconnect, and
 application shutdown. UI tests cover workspace ownership, background responses,
 draft and undo preservation, profile changes, and transaction confirmation.
+Batch tests cover mixed writes, database defaults, generated values, concurrency
+conflicts, deferred constraints, cancellation, lost commit responses, and refresh
+failures. UI tests also check staging, discard, pending colors, and batch ownership.
+Paging tests verify bounded server execution, stable snapshots, transaction
+ownership, cancellation, cursor replacement, staged edits, and row numbering.
 
 Session ownership is in `src/db/sessions.rs`. Workspace state and result handling
 are in `src/app/workspace.rs`; switching and lifecycle actions are in
 `src/app/sessions.rs`.
+Server cursors and SQL classification are in `src/db/paging.rs`.
+Local table changes are in `src/app/table_edits.rs`; transactional batch writes
+are in `src/db/changes.rs`.
 
 Textgres is licensed under [GPL-3.0-only](LICENSE).

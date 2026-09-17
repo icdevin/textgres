@@ -113,9 +113,9 @@ fn background_responses_stay_with_their_workspace() {
   assert_eq!(app.workspaces[&first].status, "first done");
 }
 
-// Recovery of an inactive row edit must not open its dialog over another database.
+// A failed inactive batch keeps its local draft without opening a dialog on another database.
 #[test]
-fn background_row_error_restores_only_its_own_form() {
+fn background_batch_error_preserves_only_its_own_draft() {
   let (_directory, _runtime, mut app) = pending_row_app();
   let (first, second) = targets();
   app.switch_workspace(first.clone());
@@ -127,11 +127,13 @@ fn background_row_error_restores_only_its_own_form() {
     result: Err(db::Cancelled.into()),
   });
   assert!(app.workspace.overlay.is_none());
-  assert!(matches!(
-    app.workspaces[&first].overlay,
-    Some(Overlay::RowDetail(_))
-  ));
-  assert!(app.workspaces[&first].pending_row_edit.is_none());
+  assert!(app.workspaces[&first].overlay.is_none());
+  assert_eq!(
+    app.workspaces[&first]
+      .edits
+      .count(&app.workspaces[&first].result),
+    1
+  );
 }
 
 // Explorer activation and keyboard cycling remain usable while a different workspace runs SQL.

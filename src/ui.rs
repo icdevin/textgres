@@ -153,9 +153,11 @@ fn draw_sql(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .find(|profile| profile.id == *profile_id)
         .map_or(profile_id.as_str(), |profile| profile.name.as_str());
-      // Normal autocommit needs no warning; retain transaction and connection diagnostics.
+      // Routine connection and paging state do not need title labels.
       match app.workspace.session_state {
-        SessionState::Connected(TransactionState::Idle) => format!(" SQL · {name}/{database} "),
+        SessionState::Connected(TransactionState::Idle | TransactionState::Paging) => {
+          format!(" SQL · {name}/{database} ")
+        }
         state => format!(" SQL · {name}/{database} · {} ", state.label()),
       }
     })
@@ -168,10 +170,25 @@ fn draw_sql(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
   // Use the result's known object, never the currently selected Explorer row or SQL text.
-  let title = app.workspace.result.source.as_ref().map_or_else(
+  let mut title = app.workspace.result.source.as_ref().map_or_else(
     || " SQL results ".to_owned(),
     |source| format!(" Results · {}.{} ", source.table.schema, source.table.name),
   );
+  // Pending rows remain visible until the complete batch is saved or discarded.
+  let changes = app.workspace.edits.count(&app.workspace.result);
+  if changes > 0 {
+    title = format!("{} · {changes} pending ", title.trim_end());
+  }
+  if app.workspace.edits.uncertain {
+    title = format!("{} · save outcome unknown ", title.trim_end());
+  }
+  if app.workspace.result.page.is_some() {
+    title = format!(
+      "{} · {}+ rows ",
+      title.trim_end(),
+      app.workspace.result.rows.len() - app.workspace.edits.new_defaults.len()
+    );
+  }
   let block = pane_block(&title, app.workspace.focus == Focus::Results);
   if app.workspace.result.columns.is_empty() {
     let text = if app.workspace.result.status.is_empty() {
@@ -190,20 +207,32 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
   }
 
   // Size columns from visible data while bounding sparse IDs and large text values.
-  let available = area.width.saturating_sub(4);
+  // The result ordinal stays fixed at the left while database columns scroll horizontally.
+  let number_width = app
+    .workspace
+    .result
+    .rows
+    .len()
+    .max(1)
+    .to_string()
+    .len()
+    .max(3) as u16;
+  let available = area.width.saturating_sub(5 + number_width);
   let start = app
     .workspace
     .result_column
     .min(app.workspace.result.columns.len().saturating_sub(1));
   let visible = visible_columns(&app.workspace.result, start, available);
-  let widths = visible
-    .iter()
-    .map(|(_, width)| Constraint::Length(*width))
+  let widths = std::iter::once(Constraint::Length(number_width))
+    .chain(visible.iter().map(|(_, width)| Constraint::Length(*width)))
     .collect::<Vec<_>>();
   let header = Row::new(
-    visible
-      .iter()
-      .map(|(index, _)| Cell::from(app.workspace.result.columns[*index].as_str())),
+    // Leave the row-number gutter untitled to distinguish it from database columns.
+    std::iter::once(Cell::from("")).chain(
+      visible
+        .iter()
+        .map(|(index, _)| Cell::from(app.workspace.result.columns[*index].as_str())),
+    ),
   )
   .style(
     Style::default()
@@ -211,12 +240,42 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
       .add_modifier(Modifier::BOLD),
   )
   .bottom_margin(1);
-  let rows = app.workspace.result.rows.iter().map(|values| {
-    Row::new(visible.iter().map(|(index, _)| {
-      let value = values.get(*index).and_then(Option::as_deref);
-      result_cell(value)
-    }))
-  });
+  let rows = app
+    .workspace
+    .result
+    .rows
+    .iter()
+    .enumerate()
+    .map(|(row, values)| {
+      Row::new(
+        std::iter::once(Cell::from((row + 1).to_string()).style(Style::default().fg(THEME.muted)))
+          .chain(visible.iter().map(|(index, _)| {
+            let value = values.get(*index).and_then(Option::as_deref);
+            // Keep cell foreground colors when the selection row changes its background.
+            let edits = &app.workspace.edits;
+            let defaults = edits.defaults(row);
+            let color = if edits.deleted.contains(&row) {
+              Some(THEME.red)
+            } else if defaults.is_some() {
+              Some(THEME.green)
+            } else if edits.cell_changed(&app.workspace.result, row, *index) {
+              Some(THEME.yellow)
+            } else {
+              None
+            };
+            if let Some(color) = color {
+              let text = if defaults.is_some_and(|defaults| defaults[*index]) {
+                "DEFAULT".into()
+              } else {
+                value.map_or_else(|| "NULL".into(), one_line)
+              };
+              Cell::from(text).style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+            } else {
+              result_cell(value)
+            }
+          })),
+      )
+    });
   let mut state = TableState::default();
   state.select(Some(app.workspace.result_row));
   let viewport_height = area.height.saturating_sub(4) as usize;
@@ -312,8 +371,15 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       Overlay::LoadScript { .. } => {
         vec![("↑↓", "select"), ("Enter", "load"), ("Esc", "cancel")]
       }
+      Overlay::RowDetail(form) if form.is_new && form.row_is_editable() => vec![
+        ("Enter", "edit"),
+        ("^N", "NULL"),
+        ("^D", "DEFAULT"),
+        ("^S", "stage row"),
+        ("Esc", "done"),
+      ],
       Overlay::RowDetail(form) if form.editing => {
-        vec![("Esc", "done"), ("^N", "toggle NULL"), ("^S", "save row")]
+        vec![("Esc", "done"), ("^N", "toggle NULL"), ("^S", "stage row")]
       }
       Overlay::RowDetail(form) if !form.row_is_editable() => {
         vec![("↑↓", "field"), ("Esc", "close")]
@@ -322,12 +388,13 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
         ("↑↓", "field"),
         ("Enter", "edit"),
         ("^N", "toggle NULL"),
-        ("^S", "save row"),
+        ("^S", "stage row"),
         ("Esc", "close"),
       ],
       Overlay::ConfirmDelete { .. } => {
         vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
       }
+      Overlay::ConfirmRefresh => vec![("Y", "discard and refresh"), ("N/Esc", "cancel")],
       Overlay::ConfirmSession(_) => vec![("Y", "confirm"), ("N/Esc", "cancel")],
     };
   }
@@ -367,9 +434,16 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("^Q", "quit"),
     ],
     Focus::Results => vec![
+      ("PgUp/Dn", "scroll"),
       ("↑↓", "rows"),
       ("←→", "columns"),
-      ("Enter", "inspect"),
+      // Show short aliases to keep the bar compact; alternate bindings remain available.
+      ("n", "add"),
+      ("d", "delete"),
+      ("e", "edit"),
+      ("^S", "save all"),
+      ("^Z", "discard all"),
+      ("F5", "refresh"),
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
@@ -522,6 +596,12 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
       frame.render_stateful_widget(list, area, &mut state);
     }
     Overlay::RowDetail(form) => draw_row_detail(frame, form),
+    Overlay::ConfirmRefresh => {
+      // Refresh must not silently replace staged values with database values.
+      let area = centered(frame.area(), 70, 7);
+      frame.render_widget(Clear, area);
+      frame.render_widget(Paragraph::new("Discard pending table changes and refresh from the database? If the last save outcome was unknown, verify the refreshed data before editing. Y: refresh · N/Esc: keep changes").wrap(Wrap { trim: false }).block(pane_block(" Refresh table? ", true).padding(Padding::uniform(1))), area);
+    }
     Overlay::ConfirmSession(action) => {
       // Require an explicit Y so Enter cannot accidentally discard a transaction.
       let area = centered(frame.area(), 70, 9);
@@ -590,7 +670,11 @@ fn draw_row_detail(frame: &mut Frame<'_>, form: &crate::app::RowDetail) {
       "  "
     };
     let value = form.values.get(index).and_then(Option::as_deref);
-    let value = value.map_or_else(|| "NULL".to_owned(), one_line);
+    let value = if form.defaults[index] {
+      "DEFAULT".to_owned()
+    } else {
+      value.map_or_else(|| "NULL".to_owned(), one_line)
+    };
     ListItem::new(Line::from(vec![
       Span::styled(
         format!("{marker}{name}"),
@@ -621,6 +705,12 @@ fn draw_row_detail(frame: &mut Frame<'_>, form: &crate::app::RowDetail) {
   frame.render_widget(value_block, panes[1]);
   if form.editing {
     frame.render_widget(&form.editor, value_area);
+  } else if form.defaults[form.selected] {
+    // DEFAULT is not NULL: the server supplies a generated value or column default on insert.
+    frame.render_widget(
+      Paragraph::new("DEFAULT").style(Style::default().fg(THEME.green)),
+      value_area,
+    );
   } else if let Some(value) = form.selected_value() {
     frame.render_widget(Paragraph::new(value).wrap(Wrap { trim: false }), value_area);
   } else {
@@ -821,18 +911,21 @@ mod tests {
           name: "id".into(),
           type_name: "integer".into(),
           editable: true,
+          insertable: true,
           primary_key: true,
         },
         ResultColumn {
           name: "email".into(),
           type_name: "text".into(),
           editable: true,
+          insertable: true,
           primary_key: false,
         },
         ResultColumn {
           name: "note".into(),
           type_name: "text".into(),
           editable: true,
+          insertable: true,
           primary_key: false,
         },
       ],
@@ -1054,6 +1147,7 @@ mod tests {
     let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
     for state in [
       SessionState::Connected(TransactionState::Idle),
+      SessionState::Connected(TransactionState::Paging),
       SessionState::Connected(TransactionState::Failed),
       SessionState::Connected(TransactionState::Unknown),
       SessionState::Disconnected,
@@ -1069,13 +1163,140 @@ mod tests {
         .map(|cell| cell.symbol())
         .collect::<String>();
       assert!(!screen.contains("autocommit"));
+      assert!(!screen.contains("result cursor open"));
       assert!(screen.contains("SQL · Local/postgres"));
-      if state != SessionState::Connected(TransactionState::Idle) {
+      if !matches!(
+        state,
+        SessionState::Connected(TransactionState::Idle | TransactionState::Paging)
+      ) {
         assert!(screen.contains(state.label()));
       }
     }
   }
 
+  // Pending colors must survive row selection and override NULL styling only on changed rows.
+  #[test]
+  fn renders_pending_rows_cells_and_defaults() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = crate::storage::Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = mpsc::channel();
+    let mut app = App::new(storage, vec![], vec![], runtime.handle().clone(), sender);
+    app.workspace.focus = Focus::Results;
+    app.workspace.result.columns = vec!["id".into(), "value".into()];
+    app.workspace.result.rows = vec![
+      vec![Some("1".into()), Some("old".into())],
+      vec![Some("2".into()), None],
+    ];
+    app.workspace.result.source = Some(TableResultSource {
+      table: TableRef {
+        profile_id: "local".into(),
+        database: "postgres".into(),
+        schema: "public".into(),
+        name: "items".into(),
+        kind: "table".into(),
+      },
+      columns: ["id", "value"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ResultColumn {
+          name: name.into(),
+          type_name: "text".into(),
+          editable: true,
+          insertable: true,
+          primary_key: index == 0,
+        })
+        .collect(),
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let Some(Overlay::RowDetail(form)) = &mut app.workspace.overlay else {
+      panic!("missing row editor")
+    };
+    form.values[1] = Some("changed".into());
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    app.workspace.result_row = 1;
+    app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE));
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let screen = terminal
+      .backend()
+      .buffer()
+      .content()
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect::<String>();
+    assert!(screen.contains("DEFAULT"));
+    assert!(screen.contains("^D DEFAULT"));
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(app.workspace.overlay.is_none());
+    assert_eq!(app.workspace.edits.count(&app.workspace.result), 3);
+    // Render only Results to make cell coordinates independent of the surrounding layout.
+    for selected in 0..3 {
+      app.workspace.result_row = selected;
+      terminal
+        .draw(|frame| draw_results(frame, &app, frame.area()))
+        .unwrap();
+      let buffer = terminal.backend().buffer();
+      let text = buffer
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+      assert!(text.contains("3 pending"));
+      for (needle, color) in [
+        ("changed", THEME.yellow),
+        ("NULL", THEME.red),
+        ("DEFAULT", THEME.green),
+      ] {
+        let (x, y) = (0..buffer.area.height)
+          .find_map(|y| {
+            let line = (0..buffer.area.width)
+              .map(|x| buffer[(x, y)].symbol())
+              .collect::<String>();
+            // All text before these cells is single-width, including the pane border and selector.
+            line
+              .find(needle)
+              .map(|byte| (line[..byte].chars().count() as u16, y))
+          })
+          .expect("pending value missing");
+        for offset in 0..needle.len() as u16 {
+          assert_eq!(buffer[(x + offset, y)].fg, color, "{needle}");
+          assert!(buffer[(x + offset, y)].modifier.contains(Modifier::BOLD));
+        }
+      }
+      let unchanged_key = buffer
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == "1")
+        .unwrap();
+      assert_ne!(unchanged_key.fg, THEME.yellow);
+    }
+    for action in [("^S", "save all"), ("^Z", "discard all"), ("F5", "refresh")] {
+      assert!(shortcuts(&app).contains(&action));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(app.workspace.result.rows.len(), 2);
+    assert_eq!(app.workspace.result.rows[0][1].as_deref(), Some("old"));
+    // Ordinals stay fixed when columns scroll and continue past the first 200-row page.
+    app.workspace.result.rows = (1..=205)
+      .map(|_| vec![Some("key".into()), Some("value".into())])
+      .collect();
+    app.workspace.result_column = 1;
+    app.workspace.result_row = 204;
+    terminal
+      .draw(|frame| draw_results(frame, &app, frame.area()))
+      .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(3, 1)].symbol(), " ");
+    let last_number = (3..6).map(|x| buffer[(x, 28)].symbol()).collect::<String>();
+    assert_eq!(last_number, "205");
+    assert_eq!(buffer[(3, 28)].fg, THEME.muted);
+  }
+
+  // Wide cells remain bounded so the result viewport can still show neighboring columns.
   #[test]
   fn measures_result_columns_with_sane_bounds() {
     let result = crate::db::QueryResult {

@@ -15,7 +15,7 @@ impl SessionAction {
   pub fn confirmation(self) -> &'static str {
     match self {
       Self::Quit => {
-        "Quit all sessions? Running operations will be cancelled and open transactions rolled back. Write outcomes may be unknown. Unsaved SQL text will be lost. Y: quit · N/Esc: keep working"
+        "Quit all sessions? Running operations will be cancelled and open transactions rolled back. Write outcomes may be unknown. Unsaved SQL text and pending table changes will be lost. Y: quit · N/Esc: keep working"
       }
       Self::Reconnect => {
         "Reconnect this SQL session? Any open transaction will be rolled back and session settings lost. Y: reconnect · N/Esc: keep working"
@@ -184,7 +184,10 @@ impl App {
       std::iter::once(&self.workspace)
         .chain(self.workspaces.values())
         .any(|workspace| {
-          workspace.database_task.is_some() || workspace.session_state.needs_confirmation()
+          workspace.database_task.is_some()
+            || workspace.session_state.needs_confirmation()
+            || workspace.edits.count(&workspace.result) > 0
+            || workspace.edits.uncertain
         })
     } else {
       if self.workspace.database_task.is_some() {
@@ -230,6 +233,20 @@ impl App {
 
   // Check all operations before invalidating a shared profile or SSH tunnel.
   pub(super) fn prepare_profile_change(&self, profile_id: &str) -> Result<(), String> {
+    // A profile change must not retarget a staged batch, including one in a hidden workspace.
+    if std::iter::once(&self.workspace)
+      .chain(self.workspaces.values())
+      .any(|workspace| {
+        workspace
+          .result
+          .source
+          .as_ref()
+          .is_some_and(|source| source.table.profile_id == profile_id)
+          && (workspace.edits.count(&workspace.result) > 0 || workspace.edits.uncertain)
+      })
+    {
+      return Err("Save or discard all table changes for this profile before changing it; refresh any unknown save outcome first".into());
+    }
     let active_busy = self
       .active_target
       .as_ref()

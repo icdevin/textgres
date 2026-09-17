@@ -30,6 +30,13 @@ use crate::storage::{ConnectionProfile, SshConfig};
 
 // SQL sessions own connections independently of per-operation workers.
 mod sessions;
+// Table changes are validated and committed as a single atomic batch.
+mod changes;
+// Server cursors keep result transfer bounded without rerunning SQL for each page.
+mod paging;
+pub use changes::{RowChange, UnknownCommit};
+pub use paging::PageRef;
+pub(crate) use paging::page_status;
 pub use sessions::{SessionManager, SessionState, TransactionState};
 
 const MAX_RESULT_ROWS: usize = 500;
@@ -52,6 +59,8 @@ pub struct ResultColumn {
   pub name: String,
   pub type_name: String,
   pub editable: bool,
+  // Identity ALWAYS and generated columns must use their server-generated insert values.
+  pub insertable: bool,
   pub primary_key: bool,
 }
 
@@ -70,6 +79,8 @@ pub struct QueryResult {
   pub status: String,
   pub truncated: bool,
   pub source: Option<TableResultSource>,
+  // A continuation identifies one live cursor, never SQL to execute again.
+  pub page: Option<PageRef>,
 }
 
 // Requests carry a fixed target; SQL connections are owned by the session manager.
@@ -110,12 +121,14 @@ pub enum Request {
     database: String,
     sql: String,
   },
-  UpdateRow {
+  SaveChanges {
     profile: ConnectionProfile,
     password: Option<String>,
     source: TableResultSource,
-    original: Vec<Option<String>>,
-    values: Vec<Option<String>>,
+    changes: Vec<RowChange>,
+  },
+  FetchPage {
+    page: PageRef,
   },
 }
 
@@ -140,7 +153,11 @@ pub enum Output {
   },
   Result(QueryResult),
   // The write is committed even when its separate preview refresh fails.
-  Updated(anyhow::Result<QueryResult>),
+  Saved(anyhow::Result<QueryResult>),
+  Page {
+    requested: PageRef,
+    result: QueryResult,
+  },
 }
 
 /// An operation ID keeps responses associated with the worker that owns them.
@@ -602,7 +619,10 @@ async fn execute(
   cancelled: &Arc<Cancellation>,
 ) -> anyhow::Result<Output> {
   match request {
-    Request::Connect { .. } | Request::Disconnect { .. } | Request::Query { .. } => {
+    Request::Connect { .. }
+    | Request::Disconnect { .. }
+    | Request::Query { .. }
+    | Request::FetchPage { .. } => {
       anyhow::bail!("session lifecycle requests require a session manager")
     }
     Request::Databases { profile, password } => {
@@ -685,42 +705,13 @@ async fn execute(
         tables,
       })
     }
-    Request::Preview {
-      profile,
-      password,
-      table,
-    } => {
-      let client = connect(
-        &profile,
-        password.as_deref(),
-        &table.database,
-        tunnels,
-        cancelled,
-      )
-      .await?;
-      Ok(Output::Result(preview_table(&client, table).await?))
-    }
-    Request::UpdateRow {
-      profile,
-      password,
-      source,
-      original,
-      values,
-    } => {
-      let client = connect(
-        &profile,
-        password.as_deref(),
-        &source.table.database,
-        tunnels,
-        cancelled,
-      )
-      .await?;
-      update_row(&client, &source, &original, &values).await?;
-      Ok(Output::Updated(preview_table(&client, source.table).await))
+    Request::Preview { .. } | Request::SaveChanges { .. } => {
+      anyhow::bail!("table results require a cursor manager")
     }
   }
 }
 
+#[cfg(test)]
 async fn preview_table(
   client: &DatabaseConnection,
   table: TableRef,
@@ -752,7 +743,8 @@ async fn table_columns(
       "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
               a.attgenerated = '', \
               EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid \
-                AND i.indisprimary AND a.attnum = ANY(i.indkey::smallint[])) \
+                AND i.indisprimary AND a.attnum = ANY(i.indkey::smallint[])), \
+              a.attgenerated = '' AND a.attidentity <> 'a' \
          FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -769,34 +761,11 @@ async fn table_columns(
         name: row.get(0),
         type_name: row.get(1),
         editable: table_is_editable && row.get(2),
+        insertable: table_is_editable && row.get(4),
         primary_key: row.get(3),
       })
       .collect(),
   )
-}
-
-async fn update_row(
-  client: &DatabaseConnection,
-  source: &TableResultSource,
-  original: &[Option<String>],
-  values: &[Option<String>],
-) -> anyhow::Result<()> {
-  let (sql, parameters) = build_update(source, original, values)?;
-  let parameter_refs = parameters
-    .iter()
-    .map(|value| value as &(dyn ToSql + Sync))
-    .collect::<Vec<_>>();
-  client
-    .run(client.client.batch_execute("SET statement_timeout = '30s'"))
-    .await?;
-  let affected = client
-    .run(client.client.execute(&sql, &parameter_refs))
-    .await?;
-  anyhow::ensure!(
-    affected == 1,
-    "row update conflict: expected one matching row, found {affected}"
-  );
-  Ok(())
 }
 
 // Build typed parameters from catalog metadata; never interpolate edited values.
@@ -808,6 +777,14 @@ fn build_update(
   anyhow::ensure!(
     source.columns.len() == original.len() && original.len() == values.len(),
     "row data does not match the table metadata"
+  );
+  anyhow::ensure!(
+    source
+      .columns
+      .iter()
+      .enumerate()
+      .all(|(i, column)| column.editable || original[i] == values[i]),
+    "generated or read-only columns cannot be changed"
   );
   let changed = source
     .columns
@@ -849,12 +826,7 @@ fn build_update(
     .iter()
     .map(|(index, column)| {
       parameters.push(original[*index].clone());
-      format!(
-        "{} IS NOT DISTINCT FROM ${}::text::{}",
-        quote_identifier(&column.name),
-        parameters.len(),
-        column.type_name
-      )
+      changes::predicate(column, parameters.len())
     })
     .collect::<Vec<_>>();
   let sql = format!(
@@ -1036,12 +1008,14 @@ mod tests {
           name: "id".into(),
           type_name: "integer".into(),
           editable: true,
+          insertable: true,
           primary_key: true,
         },
         ResultColumn {
           name: "display name".into(),
           type_name: "text".into(),
           editable: true,
+          insertable: true,
           primary_key: false,
         },
       ],
@@ -1058,7 +1032,7 @@ mod tests {
       sql,
       "UPDATE \"odd schema\".\"user\" SET \"display name\" = $1::text::text \
        WHERE \"id\" IS NOT DISTINCT FROM $2::text::integer AND \
-       \"display name\" IS NOT DISTINCT FROM $3::text::text"
+       to_jsonb(\"display name\") IS NOT DISTINCT FROM to_jsonb($3::text::text)"
     );
     assert_eq!(
       parameters,

@@ -21,6 +21,8 @@ use crate::{
 // Session workspaces and lifecycle actions are separate from pane input handling.
 mod sessions;
 mod workspace;
+// Local table drafts and explicit batch actions do not own SQL sessions.
+mod table_edits;
 pub use sessions::SessionAction;
 pub use workspace::Workspace;
 
@@ -234,7 +236,7 @@ impl ConnectionForm {
   }
 }
 
-/// Expanded row state keeps edits isolated until the user explicitly saves.
+// Expanded row state keeps field edits isolated until the user stages the row.
 #[derive(Clone, Debug)]
 pub struct RowDetail {
   pub row_index: usize,
@@ -242,6 +244,10 @@ pub struct RowDetail {
   pub source: Option<db::TableResultSource>,
   pub original: Vec<Option<String>>,
   pub values: Vec<Option<String>>,
+  // Defaults are separate from NULL for new rows with server-generated values.
+  pub defaults: Vec<bool>,
+  pub is_new: bool,
+  pub read_only: bool,
   pub selected: usize,
   pub editing: bool,
   pub editor: TextArea<'static>,
@@ -256,6 +262,9 @@ impl RowDetail {
       source: result.source.clone(),
       original: values.clone(),
       editor: row_value_editor(values.first().and_then(Option::as_deref)),
+      defaults: vec![false; values.len()],
+      is_new: false,
+      read_only: false,
       values,
       selected: 0,
       editing: false,
@@ -269,18 +278,22 @@ impl RowDetail {
   pub fn selected_is_editable(&self) -> bool {
     self.row_is_editable()
       && self.source.as_ref().is_some_and(|source| {
-        source
-          .columns
-          .get(self.selected)
-          .is_some_and(|column| column.editable)
+        source.columns.get(self.selected).is_some_and(|column| {
+          if self.is_new {
+            column.insertable
+          } else {
+            column.editable
+          }
+        })
       })
   }
 
   pub fn row_is_editable(&self) -> bool {
-    self.source.as_ref().is_some_and(|source| {
-      source.columns.iter().any(|column| column.primary_key)
-        && source.columns.iter().any(|column| column.editable)
-    })
+    !self.read_only
+      && self.source.as_ref().is_some_and(|source| {
+        matches!(source.table.kind.as_str(), "table" | "partitioned table")
+          && (self.is_new || source.columns.iter().any(|column| column.primary_key))
+      })
   }
 
   fn move_selection(&mut self, change: isize) {
@@ -292,6 +305,7 @@ impl RowDetail {
   fn begin_edit(&mut self) {
     if self.selected_is_editable() {
       // Entering a NULL field starts an intentional empty-string edit.
+      self.defaults[self.selected] = false;
       self.values[self.selected].get_or_insert_default();
       self.editor = row_value_editor(self.selected_value());
       self.editing = true;
@@ -309,10 +323,16 @@ impl RowDetail {
     if !self.selected_is_editable() {
       return;
     }
-    self.values[self.selected] = match self.values[self.selected] {
-      Some(_) => None,
-      None => Some(String::new()),
+    // DEFAULT is a third state: its first NULL toggle must choose NULL, not empty text.
+    self.values[self.selected] = if self.defaults[self.selected] {
+      None
+    } else {
+      match self.values[self.selected] {
+        Some(_) => None,
+        None => Some(String::new()),
+      }
     };
+    self.defaults[self.selected] = false;
     self.editor = row_value_editor(self.selected_value());
   }
 }
@@ -325,6 +345,7 @@ pub enum Overlay {
   LoadScript { selected: usize },
   RowDetail(Box<RowDetail>),
   ConfirmSession(SessionAction),
+  ConfirmRefresh,
   ConfirmDelete { profile_id: String, name: String },
 }
 
@@ -590,6 +611,24 @@ impl App {
   }
 
   fn handle_results_key(&mut self, key: KeyEvent) {
+    // Result actions stage locally; only Ctrl+S sends the batch to PostgreSQL.
+    let action = match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+      (KeyCode::Insert, _) | (KeyCode::Char('n'), false) => Some(self.add_row()),
+      (KeyCode::Delete, _) | (KeyCode::Char('d'), false) => Some(self.delete_row()),
+      (KeyCode::Char('s'), true) => Some(self.save_changes()),
+      (KeyCode::Char('z'), true) => {
+        self.discard_changes();
+        return;
+      }
+      (KeyCode::F(5), _) => Some(self.refresh_results(false)),
+      _ => None,
+    };
+    if let Some(result) = action {
+      if let Err(error) = result {
+        self.set_status(error, true);
+      }
+      return;
+    }
     match key.code {
       KeyCode::Up | KeyCode::Char('k') => {
         self.workspace.result_row = self.workspace.result_row.saturating_sub(1)
@@ -605,12 +644,27 @@ impl App {
         self.workspace.result_column = (self.workspace.result_column + 1)
           .min(self.workspace.result.columns.len().saturating_sub(1))
       }
+      KeyCode::PageDown => {
+        self.workspace.result_row =
+          (self.workspace.result_row + 20).min(self.workspace.result.rows.len().saturating_sub(1));
+      }
+      KeyCode::PageUp => self.workspace.result_row = self.workspace.result_row.saturating_sub(20),
       KeyCode::Home | KeyCode::Char('g') => self.workspace.result_row = 0,
       KeyCode::End | KeyCode::Char('G') => {
         self.workspace.result_row = self.workspace.result.rows.len().saturating_sub(1)
       }
-      KeyCode::Enter => self.open_row_detail(),
+      KeyCode::Enter | KeyCode::Char('e') => self.open_row_detail(),
       _ => {}
+    }
+    // One boundary event requests one page; End never drains the whole result automatically.
+    if matches!(
+      key.code,
+      KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown | KeyCode::End | KeyCode::Char('G')
+    ) && self.workspace.result_row >= self.workspace.result.rows.len().saturating_sub(1)
+      && self.workspace.database_task.is_none()
+      && let Some(page) = self.workspace.result.page.clone()
+    {
+      self.dispatch("Loading next 200 rows".into(), Request::FetchPage { page });
     }
   }
 
@@ -708,10 +762,22 @@ impl App {
         self.workspace.overlay = Some(overlay);
       }
       Overlay::RowDetail(form) => {
+        if form.is_new
+          && form.selected_is_editable()
+          && key.modifiers.contains(KeyModifiers::CONTROL)
+          && key.code == KeyCode::Char('d')
+        {
+          form.defaults[form.selected] = true;
+          form.values[form.selected] = None;
+          form.editing = false;
+          form.editor = row_value_editor(None);
+          self.workspace.overlay = Some(overlay);
+          return;
+        }
         if form.editing {
           if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             form.finish_edit();
-            if let Err(error) = self.save_row(form) {
+            if let Err(error) = self.stage_row(form) {
               self.set_status(error, true);
               self.workspace.overlay = Some(overlay);
             }
@@ -731,7 +797,7 @@ impl App {
           return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-          if let Err(error) = self.save_row(form) {
+          if let Err(error) = self.stage_row(form) {
             self.set_status(error, true);
             self.workspace.overlay = Some(overlay);
           }
@@ -754,6 +820,15 @@ impl App {
         }
         self.workspace.overlay = Some(overlay);
       }
+      Overlay::ConfirmRefresh => match key.code {
+        KeyCode::Char('y') => {
+          if let Err(error) = self.refresh_results(true) {
+            self.set_status(error, true);
+          }
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {}
+        _ => self.workspace.overlay = Some(overlay),
+      },
       Overlay::ConfirmSession(action) => match key.code {
         KeyCode::Char('y') => self.perform_session_action(*action),
         KeyCode::Char('n') | KeyCode::Esc => {}
@@ -862,6 +937,11 @@ impl App {
         }
       }
       ExplorerNode::Table(table) => {
+        if self.workspace.edits.count(&self.workspace.result) > 0 || self.workspace.edits.uncertain
+        {
+          self.set_status("Save or discard table changes before opening another table; refresh any unknown save outcome first".into(), true);
+          return;
+        }
         if let Some(profile) = self.profile(&table.profile_id).cloned() {
           self.dispatch(
             format!("Previewing {}.{}", table.schema, table.name),
@@ -899,6 +979,15 @@ impl App {
   }
 
   fn run_sql(&mut self) {
+    // Replacing a preview must never discard an unsaved table batch.
+    if self.workspace.edits.count(&self.workspace.result) > 0 || self.workspace.edits.uncertain {
+      self.set_status(
+        "Save or discard table changes before running SQL; refresh any unknown save outcome first"
+          .into(),
+        true,
+      );
+      return;
+    }
     if self.workspace.busy.is_some() {
       return;
     }
@@ -929,7 +1018,15 @@ impl App {
   }
 
   fn open_row_detail(&mut self) {
-    if let Some(form) = RowDetail::new(&self.workspace.result, self.workspace.result_row) {
+    if let Some(mut form) = RowDetail::new(&self.workspace.result, self.workspace.result_row) {
+      // Row editing reflects the staged row while retaining its original visible snapshot.
+      if let Some(defaults) = self.workspace.edits.defaults(form.row_index) {
+        form.is_new = true;
+        form.defaults = defaults.clone();
+      }
+      form.read_only = self.workspace.edits.uncertain
+        || self.workspace.database_task.is_some()
+        || self.workspace.edits.deleted.contains(&form.row_index);
       // Keep the large multiline editor outside the compact overlay enum.
       self.workspace.overlay = Some(Overlay::RowDetail(Box::new(form)));
     } else {
@@ -937,51 +1034,19 @@ impl App {
     }
   }
 
-  fn save_row(&mut self, form: &RowDetail) -> Result<(), String> {
-    if self.workspace.busy.is_some() {
-      return Err("Wait for the current database operation to finish".into());
-    }
-    let source = form
-      .source
-      .clone()
-      .ok_or_else(|| "Custom SQL results are read-only".to_owned())?;
-    // A retained row form must not dispatch an update after its preview is invalidated.
-    if self.workspace.result.source.as_ref() != Some(&source) {
-      return Err("The table preview is no longer current; reload the table before saving".into());
-    }
-    if !source.columns.iter().any(|column| column.primary_key) {
-      return Err("This table has no primary key; the row is read-only".into());
-    }
-    if form.original == form.values {
-      return Err("No row values changed".into());
-    }
-    let profile_id = &source.table.profile_id;
-    let profile = self
-      .profile(profile_id)
-      .cloned()
-      .ok_or_else(|| "The source connection no longer exists".to_owned())?;
-    self.workspace.pending_row_edit = Some(form.clone());
-    self.dispatch(
-      format!(
-        "Updating row in {}.{}",
-        source.table.schema, source.table.name
-      ),
-      Request::UpdateRow {
-        password: self.password(profile_id),
-        profile,
-        source,
-        original: form.original.clone(),
-        values: form.values.clone(),
-      },
-    );
-    Ok(())
-  }
-
   fn dispatch(&mut self, description: String, request: Request) {
     // One operation at a time keeps cancellation and response ownership exact.
     if self.workspace.database_task.is_some() {
       self.set_status("Wait for this workspace's operation to finish".into(), true);
       return;
+    }
+    self.workspace.fetching_page = matches!(request, Request::FetchPage { .. });
+    // Starting a replacement retires the old cursor even if the new operation later fails.
+    if matches!(
+      request,
+      Request::Query { .. } | Request::Preview { .. } | Request::SaveChanges { .. }
+    ) {
+      self.workspace.result.page = None;
     }
     let operation_id = self.next_operation_id;
     self.next_operation_id = self.next_operation_id.wrapping_add(1);
@@ -1221,10 +1286,17 @@ fn row_value_editor(value: Option<&str>) -> TextArea<'static> {
 }
 
 fn row_read_only_reason(form: &RowDetail) -> String {
+  // A frozen or deleted row must not be described as a generated-column restriction.
+  if form.read_only {
+    return "This row is read-only while deleted, busy, or awaiting save verification".into();
+  }
   let Some(source) = &form.source else {
     return "Custom SQL results are read-only".into();
   };
-  if !source.columns.iter().any(|column| column.primary_key) {
+  if !matches!(source.table.kind.as_str(), "table" | "partitioned table") {
+    return "This object is read-only".into();
+  }
+  if !form.is_new && !source.columns.iter().any(|column| column.primary_key) {
     return "This table has no primary key; the row is read-only".into();
   }
   "This generated column is read-only".into()
@@ -1286,6 +1358,10 @@ fn is_run_key(key: KeyEvent) -> bool {
 mod tests {
   // Session tests share the deterministic, network-free application fixtures.
   mod sessions;
+  // Table drafts share the deterministic application fixtures.
+  mod table_edits;
+  // Result continuation regressions use the shared workspace fixtures.
+  mod paging;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 
@@ -1380,21 +1456,20 @@ mod tests {
 
   // Unsaved values remain recoverable only after the worker confirms cancellation.
   #[test]
-  fn confirmed_cancellation_restores_pending_row_edits() {
+  fn confirmed_cancellation_preserves_staged_changes() {
     let (_directory, _runtime, mut app) = pending_row_app();
     let operation_id = app.workspace.database_task.as_ref().unwrap().operation_id();
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(app.workspace.overlay.is_none());
-    assert!(app.workspace.pending_row_edit.is_some());
+    assert_eq!(app.workspace.edits.count(&app.workspace.result), 1);
     app.handle_database_response(Response {
       session_state: None,
       operation_id,
       result: Err(db::Cancelled.into()),
     });
-    let Some(Overlay::RowDetail(form)) = &app.workspace.overlay else {
-      panic!("cancelled edit must be restored");
-    };
-    assert_eq!(form.values[1].as_deref(), Some("changed"));
+    assert!(app.workspace.overlay.is_none());
+    assert_eq!(app.workspace.result.rows[0][1].as_deref(), Some("changed"));
+    assert_eq!(app.workspace.edits.count(&app.workspace.result), 1);
     assert!(!app.workspace.status_is_error);
     assert!(app.workspace.busy.is_none());
   }
@@ -1407,10 +1482,10 @@ mod tests {
     app.handle_database_response(Response {
       session_state: None,
       operation_id,
-      result: Ok(Output::Updated(Err(db::Cancelled.into()))),
+      result: Ok(Output::Saved(Err(db::Cancelled.into()))),
     });
-    assert_eq!(app.workspace.status, "Row saved; refresh cancelled");
-    assert!(app.workspace.pending_row_edit.is_none());
+    assert_eq!(app.workspace.status, "Changes saved; refresh cancelled");
+    assert_eq!(app.workspace.edits.count(&app.workspace.result), 0);
     assert!(app.workspace.overlay.is_none());
     assert!(app.workspace.result.source.is_none());
     assert!(app.workspace.result.rows.is_empty());
@@ -1424,16 +1499,16 @@ mod tests {
     app.handle_database_response(Response {
       session_state: None,
       operation_id,
-      result: Ok(Output::Updated(Err(anyhow::anyhow!("connection closed")))),
+      result: Ok(Output::Saved(Err(anyhow::anyhow!("connection closed")))),
     });
     assert!(
       app
         .workspace
         .status
-        .starts_with("Row saved; refresh failed:")
+        .starts_with("Changes saved; refresh failed:")
     );
     assert!(app.workspace.status_is_error);
-    assert!(app.workspace.pending_row_edit.is_none());
+    assert_eq!(app.workspace.edits.count(&app.workspace.result), 0);
     assert!(app.workspace.overlay.is_none());
   }
 
@@ -1472,12 +1547,12 @@ mod tests {
       );
       assert!(
         app
-          .save_row(&old_form)
+          .stage_row(&old_form)
           .unwrap_err()
           .contains("reload the table")
       );
       assert!(app.workspace.database_task.is_none());
-      assert!(app.workspace.pending_row_edit.is_none());
+      assert_eq!(app.workspace.edits.count(&app.workspace.result), 0);
       app.workspace.focus = Focus::Results;
       app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
       assert!(app.workspace.overlay.is_none());
@@ -1505,7 +1580,8 @@ mod tests {
     assert_eq!(app.workspace.result_column, 2);
     let mut row_form = RowDetail::new(&app.workspace.result, 0).unwrap();
     row_form.values[1] = Some("changed".into());
-    app.save_row(&row_form).unwrap();
+    app.stage_row(&row_form).unwrap();
+    app.save_changes().unwrap();
     assert!(app.workspace.database_task.is_some());
   }
 
@@ -1530,7 +1606,8 @@ mod tests {
     assert_eq!(app.active_target, target);
     let mut row_form = RowDetail::new(&app.workspace.result, 0).unwrap();
     row_form.values[1] = Some("changed".into());
-    app.save_row(&row_form).unwrap();
+    app.stage_row(&row_form).unwrap();
+    app.save_changes().unwrap();
     assert!(app.workspace.database_task.is_some());
   }
 
@@ -1552,7 +1629,7 @@ mod tests {
       (0, 0)
     );
     assert!(app.workspace.overlay.is_none());
-    assert!(app.save_row(&old_form).is_err());
+    assert!(app.stage_row(&old_form).is_err());
     assert!(app.workspace.database_task.is_none());
   }
 
@@ -1607,7 +1684,8 @@ mod tests {
     let (directory, runtime, mut app) = preview_app();
     let mut form = RowDetail::new(&app.workspace.result, 0).unwrap();
     form.values[1] = Some("changed".into());
-    app.save_row(&form).unwrap();
+    app.stage_row(&form).unwrap();
+    app.save_changes().unwrap();
     (directory, runtime, app)
   }
 
@@ -1709,18 +1787,21 @@ mod tests {
             name: "id".into(),
             type_name: "integer".into(),
             editable: true,
+            insertable: true,
             primary_key: true,
           },
           db::ResultColumn {
             name: "name".into(),
             type_name: "text".into(),
             editable: true,
+            insertable: true,
             primary_key: false,
           },
           db::ResultColumn {
             name: "slug".into(),
             type_name: "text".into(),
             editable: false,
+            insertable: false,
             primary_key: false,
           },
         ],
