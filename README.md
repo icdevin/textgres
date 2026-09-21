@@ -45,9 +45,13 @@ The bottom bar shows available actions. `^` means `Ctrl`.
 | Explorer | `c` | Connect / disconnect |
 | SQL | `F5` | Run SQL |
 | SQL | `Ctrl+S` / `Ctrl+L` | Save / load a script |
+| Script picker | `d` / `Delete` | Delete a saved script after confirmation |
 | Results | `n` / `e` / `d` | Add / edit / mark a row for deletion |
 | Results | `Ctrl+S` / `Ctrl+Z` | Save / discard all pending changes |
 | Results | `F5` | Refresh the table preview |
+
+In the script picker, confirm deletion with `y` or `Enter`; cancel with `n` or
+`Esc`. Deletion removes the saved file and keeps the SQL editor text.
 
 ## Edit rows
 

@@ -196,6 +196,13 @@ impl Storage {
     fs::write(&path, sql).with_context(|| format!("could not write {}", path.display()))
   }
 
+  // Validate before removal so a script name cannot target files outside this directory.
+  pub fn delete_script(&self, name: &str) -> anyhow::Result<()> {
+    validate_script_name(name)?;
+    let path = self.script_path(name);
+    fs::remove_file(&path).with_context(|| format!("could not delete {}", path.display()))
+  }
+
   fn script_path(&self, name: &str) -> PathBuf {
     self
       .root
@@ -356,6 +363,31 @@ require_tls = false
     let storage = Storage::new(directory.path().to_owned()).unwrap();
 
     assert!(storage.save_script("../secret", "select 1").is_err());
+  }
+
+  // Invalid names must never allow deletion outside the script directory.
+  #[test]
+  fn rejects_script_deletion_path_traversal() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path().to_owned()).unwrap();
+    let outside = directory.path().join("secret.sql");
+    fs::write(&outside, "SELECT 1;").unwrap();
+    assert!(storage.delete_script("../secret").is_err());
+    assert!(storage.delete_script("").is_err());
+    assert_eq!(fs::read_to_string(outside).unwrap(), "SELECT 1;");
+  }
+
+  // Removal must affect only the selected file and report missing files as errors.
+  #[test]
+  fn deletes_only_the_named_script() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path().to_owned()).unwrap();
+    storage.save_script("remove", "SELECT 1;").unwrap();
+    storage.save_script("keep", "SELECT 2;").unwrap();
+    storage.delete_script("remove").unwrap();
+    assert_eq!(storage.list_scripts().unwrap(), ["keep"]);
+    assert_eq!(storage.load_script("keep").unwrap().sql, "SELECT 2;");
+    assert!(storage.delete_script("remove").is_err());
   }
 
   #[test]

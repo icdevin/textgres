@@ -350,6 +350,11 @@ pub enum Overlay {
   LoadScript {
     selected: usize,
   },
+  // Keep the confirmed name stable and restore the picker position after cancellation.
+  ConfirmDeleteScript {
+    name: String,
+    selected: usize,
+  },
   RowDetail(Box<RowDetail>),
   ConfirmSession(SessionAction),
   ConfirmExplorerDisconnect {
@@ -759,6 +764,18 @@ impl App {
           KeyCode::End | KeyCode::Char('G') => {
             *selected = self.scripts.len().saturating_sub(1);
           }
+          // Deletion requires a separate confirmation before touching the saved file.
+          KeyCode::Char('d') | KeyCode::Delete => {
+            let Some(name) = self.scripts.get(*selected).cloned() else {
+              self.set_status("No saved scripts".into(), true);
+              return;
+            };
+            self.workspace.overlay = Some(Overlay::ConfirmDeleteScript {
+              name,
+              selected: *selected,
+            });
+            return;
+          }
           KeyCode::Enter => {
             let Some(name) = self.scripts.get(*selected).cloned() else {
               self.set_status("No saved scripts".into(), true);
@@ -781,6 +798,29 @@ impl App {
         }
         self.workspace.overlay = Some(overlay);
       }
+      Overlay::ConfirmDeleteScript { name, selected } => match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+          if let Err(error) = self.storage.delete_script(name) {
+            self.set_status(format!("Could not delete script: {error:#}"), true);
+            self.workspace.overlay = Some(overlay);
+            return;
+          }
+          // Only remove the cached entry after disk success; keep unsaved editor text intact.
+          self.scripts.retain(|script| script != name);
+          self.set_status(format!("Deleted {name}.sql"), false);
+          if !self.scripts.is_empty() {
+            self.workspace.overlay = Some(Overlay::LoadScript {
+              selected: (*selected).min(self.scripts.len() - 1),
+            });
+          }
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+          self.workspace.overlay = Some(Overlay::LoadScript {
+            selected: *selected,
+          });
+        }
+        _ => self.workspace.overlay = Some(overlay),
+      },
       Overlay::RowDetail(form) => {
         if form.is_new
           && form.selected_is_editable()
@@ -1394,6 +1434,8 @@ mod tests {
   mod paging;
   // Explorer disconnect regressions share the workspace fixtures.
   mod explorer_sessions;
+  // Saved script tests exercise confirmation and disk failures without a database.
+  mod scripts;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 

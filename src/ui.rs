@@ -369,7 +369,13 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       }
       Overlay::SaveScript { .. } => vec![("Enter", "save"), ("Esc", "cancel")],
       Overlay::LoadScript { .. } => {
-        vec![("↑↓", "select"), ("Enter", "load"), ("Esc", "cancel")]
+        // Advertise deletion where the saved script is selected.
+        vec![
+          ("↑↓", "select"),
+          ("Enter", "load"),
+          ("d/Del", "delete"),
+          ("Esc", "cancel"),
+        ]
       }
       Overlay::RowDetail(form) if form.is_new && form.row_is_editable() => vec![
         ("Enter", "edit"),
@@ -391,7 +397,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
         ("^S", "stage row"),
         ("Esc", "close"),
       ],
-      Overlay::ConfirmDelete { .. } => {
+      Overlay::ConfirmDelete { .. } | Overlay::ConfirmDeleteScript { .. } => {
         vec![("Y/Enter", "delete"), ("N/Esc", "cancel")]
       }
       Overlay::ConfirmRefresh => vec![("Y", "discard and refresh"), ("N/Esc", "cancel")],
@@ -633,11 +639,17 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
         area,
       );
     }
-    Overlay::ConfirmDelete { name, .. } => {
+    Overlay::ConfirmDelete { name, .. } | Overlay::ConfirmDeleteScript { name, .. } => {
+      // Use the same confirmation layout while identifying the exact deletion target.
+      let prompt = match overlay {
+        Overlay::ConfirmDeleteScript { .. } => format!("Delete script “{name}.sql”?"),
+        _ => format!("Delete connection “{name}”?"),
+      };
       let area = centered(frame.area(), 50, 5);
       frame.render_widget(Clear, area);
       frame.render_widget(
-        Paragraph::new(Line::from(format!("Delete connection “{name}”?")))
+        Paragraph::new(prompt)
+          .wrap(Wrap { trim: false })
           .alignment(Alignment::Center)
           .block(
             Block::default()
