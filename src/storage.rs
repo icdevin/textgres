@@ -15,6 +15,40 @@ use serde::{Deserialize, Serialize};
 
 const CONNECTIONS_FILE: &str = "connections.toml";
 const SCRIPTS_DIRECTORY: &str = "scripts";
+const SETTINGS_FILE: &str = "settings.toml";
+
+// Global Explorer preferences keep connection credentials separate from display choices.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Settings {
+  pub show_all_databases: bool,
+  pub show_system_schemas: bool,
+  pub show_utility_schemas: bool,
+}
+
+impl Default for Settings {
+  // Preserve the existing Explorer view when no settings have been saved.
+  fn default() -> Self {
+    Self {
+      show_all_databases: true,
+      show_system_schemas: false,
+      show_utility_schemas: false,
+    }
+  }
+}
+
+impl Settings {
+  // Utility schemas have their own switch, so showing them does not require system schemas.
+  pub fn shows_schema(&self, name: &str) -> bool {
+    if name.starts_with("pg_temp_") || name.starts_with("pg_toast") {
+      self.show_utility_schemas
+    } else if name == "information_schema" || name.starts_with("pg_") {
+      self.show_system_schemas
+    } else {
+      true
+    }
+  }
+}
 
 /// A reusable connection, including its optional saved password.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +121,28 @@ pub struct Storage {
 }
 
 impl Storage {
+  // Missing settings use defaults; malformed or unreadable settings must fail explicitly.
+  pub fn load_settings(&self) -> anyhow::Result<Settings> {
+    let path = self.root.join(SETTINGS_FILE);
+    let source = match fs::read_to_string(&path) {
+      Ok(source) => source,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
+      Err(error) => {
+        return Err(error).with_context(|| format!("could not read {}", path.display()));
+      }
+    };
+    toml::from_str(&source).with_context(|| format!("could not parse {}", path.display()))
+  }
+
+  // Replace the file only after serialization and writing succeed, as with connections.
+  pub fn save_settings(&self, settings: &Settings) -> anyhow::Result<()> {
+    let encoded = toml::to_string_pretty(settings).context("could not encode settings")?;
+    let path = self.root.join(SETTINGS_FILE);
+    let temporary = self.root.join("settings.toml.tmp");
+    write_private_file(&temporary, encoded.as_bytes())?;
+    fs::rename(&temporary, &path).with_context(|| format!("could not replace {}", path.display()))
+  }
+
   /// Uses an override for tests and automation, then the platform data directory.
   pub fn discover() -> anyhow::Result<Self> {
     if let Some(root) = env::var_os("TEXTGRES_DATA_DIR") {
@@ -274,6 +330,34 @@ fn validate_script_name(name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // New settings use defaults, partial files inherit defaults, and invalid files fail early.
+  #[test]
+  fn settings_defaults_round_trip_and_reject_invalid_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Storage::new(directory.path().to_owned()).unwrap();
+    assert_eq!(storage.load_settings().unwrap(), Settings::default());
+    let settings = Settings {
+      show_all_databases: false,
+      show_system_schemas: true,
+      show_utility_schemas: true,
+    };
+    storage.save_settings(&settings).unwrap();
+    assert_eq!(storage.load_settings().unwrap(), settings);
+    let path = storage.root().join(SETTINGS_FILE);
+    fs::write(&path, "show_utility_schemas = true").unwrap();
+    assert_eq!(
+      storage.load_settings().unwrap(),
+      Settings {
+        show_utility_schemas: true,
+        ..Settings::default()
+      }
+    );
+    fs::write(&path, "show_all_databases = 'yes'").unwrap();
+    assert!(storage.load_settings().is_err());
+    fs::write(&path, "show_all_database = true").unwrap();
+    assert!(storage.load_settings().is_err());
+  }
 
   fn profile() -> ConnectionProfile {
     ConnectionProfile {

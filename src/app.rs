@@ -14,7 +14,7 @@ use tokio::runtime::Handle;
 use crate::{
   db::{self, Output, QueryResult, Request, Response, TableRef},
   sql_editor::SqlEditor,
-  storage::{ConnectionProfile, SshConfig, Storage},
+  storage::{ConnectionProfile, Settings, SshConfig, Storage},
   theme::THEME,
 };
 
@@ -346,6 +346,11 @@ impl RowDetail {
 /// Only one overlay exists at once, which prevents conflicting key handlers.
 #[derive(Clone, Debug)]
 pub enum Overlay {
+  // Edit a copy so Escape leaves both the Explorer and saved preferences unchanged.
+  Settings {
+    draft: Settings,
+    selected: usize,
+  },
   Connection(Box<ConnectionForm>),
   SaveScript {
     name: String,
@@ -374,6 +379,7 @@ pub enum Overlay {
 
 /// Central application state; database work is sent to independent Tokio tasks.
 pub struct App {
+  pub settings: Settings,
   pub should_quit: bool,
   pub profiles: Vec<ConnectionProfile>,
   pub scripts: Vec<String>,
@@ -407,6 +413,7 @@ impl App {
     database_tx: Sender<Response>,
   ) -> Self {
     Self {
+      settings: Settings::default(),
       should_quit: false,
       profiles,
       scripts,
@@ -444,6 +451,10 @@ impl App {
         .contains(&NodeKey::Connection(profile.id.clone()))
       {
         for database in self.databases.get(&profile.id).into_iter().flatten() {
+          // Filter at display time so cached and late metadata responses use the latest settings.
+          if !self.settings.show_all_databases && database != &profile.database {
+            continue;
+          }
           rows.push(ExplorerRow {
             depth: 1,
             label: database.clone(),
@@ -462,6 +473,9 @@ impl App {
               .into_iter()
               .flatten()
             {
+              if !self.settings.shows_schema(schema) {
+                continue;
+              }
               rows.push(ExplorerRow {
                 depth: 2,
                 label: schema.clone(),
@@ -515,6 +529,13 @@ impl App {
       return;
     }
     match key.code {
+      KeyCode::F(2) => {
+        self.workspace.overlay = Some(Overlay::Settings {
+          draft: self.settings,
+          selected: 0,
+        });
+        return;
+      }
       KeyCode::F(6) => {
         self.request_session_action(SessionAction::Connect);
         return;
@@ -702,6 +723,42 @@ impl App {
       return;
     };
     match &mut overlay {
+      Overlay::Settings { draft, selected } => {
+        if key.code == KeyCode::Esc {
+          return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+          match self.storage.save_settings(draft) {
+            Ok(()) => {
+              self.settings = *draft;
+              // Changing visibility must not change the SQL target or close hidden sessions.
+              self.explorer_selected = self
+                .explorer_selected
+                .min(self.explorer_rows().len().saturating_sub(1));
+              self.set_status("Settings saved".into(), false);
+            }
+            Err(error) => {
+              self.set_status(format!("Could not save settings: {error:#}"), true);
+              self.workspace.overlay = Some(overlay);
+            }
+          }
+          return;
+        }
+        match key.code {
+          KeyCode::Down | KeyCode::Tab => *selected = (*selected + 1) % 3,
+          KeyCode::Up | KeyCode::BackTab => *selected = (*selected + 2) % 3,
+          KeyCode::Enter | KeyCode::Char(' ') => {
+            let value = match *selected {
+              0 => &mut draft.show_all_databases,
+              1 => &mut draft.show_system_schemas,
+              _ => &mut draft.show_utility_schemas,
+            };
+            *value = !*value;
+          }
+          _ => {}
+        }
+        self.workspace.overlay = Some(overlay);
+      }
       Overlay::Connection(form) => {
         if key.code == KeyCode::Esc {
           return;
@@ -1470,6 +1527,8 @@ mod tests {
   mod scripts;
   // Query editing tests cover the UI's capability and explicit-refresh boundaries.
   mod query_edits;
+  // Settings tests cover persistence and visibility without changing session ownership.
+  mod settings;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 

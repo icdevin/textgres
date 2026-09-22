@@ -197,10 +197,10 @@ async fn cancellation_before_connect_does_not_start_io() {
   assert!(result.err().unwrap().is::<Cancelled>());
 }
 
-// Schema browsing hides actual backend temporary schemas without hiding similar user names.
+// Metadata retains temporary schemas so the Explorer can toggle visibility without reconnecting.
 #[tokio::test]
 #[ignore = "requires local initdb and pg_ctl binaries"]
-async fn postgres_schema_list_hides_temporary_schemas() {
+async fn postgres_schema_list_supports_visibility_settings() {
   let database = TestDatabase::start();
   let observer = database.connect().await;
   observer
@@ -228,7 +228,17 @@ async fn postgres_schema_list_hides_temporary_schemas() {
   let Output::Schemas { names, .. } = response(&receiver).await.unwrap() else {
     panic!("expected schema list");
   };
-  assert_eq!(names, vec!["app", "pgxtempx1", "public"]);
+  assert!(names.contains(&temporary_schema));
+  assert!(names.iter().any(|name| name == "pg_catalog"));
+  let mut settings = crate::storage::Settings::default();
+  let visible: Vec<_> = names
+    .iter()
+    .filter(|name| settings.shows_schema(name))
+    .collect();
+  assert_eq!(visible, vec!["app", "pgxtempx1", "public"]);
+  settings.show_utility_schemas = true;
+  assert!(settings.shows_schema(&temporary_schema));
+  assert!(!settings.shows_schema("pg_catalog"));
 }
 
 // A delayed write must not commit after the user cancels it.

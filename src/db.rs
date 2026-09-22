@@ -663,15 +663,13 @@ async fn execute(
     } => {
       let profile_id = profile.id.clone();
       let client = connect(&profile, password.as_deref(), &database, tunnels, cancelled).await?;
-      // Hide backend temporary schemas; a literal prefix avoids LIKE's underscore wildcards.
+      // Cache all schema names so visibility changes need no reconnect or metadata reload.
       let rows = client
-        .run(client.client.query(
-          "SELECT nspname FROM pg_namespace \
-                     WHERE nspname NOT IN ('pg_catalog', 'information_schema') \
-                     AND nspname NOT LIKE 'pg_toast%' \
-                     AND left(nspname, 8) <> 'pg_temp_' ORDER BY nspname",
-          &[],
-        ))
+        .run(
+          client
+            .client
+            .query("SELECT nspname FROM pg_namespace ORDER BY nspname", &[]),
+        )
         .await?;
       Ok(Output::Schemas {
         profile_id,

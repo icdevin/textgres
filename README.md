@@ -40,6 +40,7 @@ The bottom bar shows available actions. `^` means `Ctrl`.
 | Anywhere | `Tab` / `Shift+Tab` | Switch panes |
 | Anywhere | `Ctrl+PageUp` / `Ctrl+PageDown` | Switch database workspaces |
 | Anywhere | `Ctrl+Q` | Quit |
+| Anywhere | `F2` | Open settings |
 | Running operation | `Esc` | Cancel |
 | Explorer | `n` / `e` / `d` | Add / edit / delete a connection |
 | Explorer | `c` | Connect / disconnect |
@@ -52,6 +53,21 @@ The bottom bar shows available actions. `^` means `Ctrl`.
 
 In the script picker, confirm deletion with `y` or `Enter`; cancel with `n` or
 `Esc`. Deletion removes the saved file and keeps the SQL editor text.
+
+## Settings
+
+Press `F2` to open settings. Use `Up` / `Down` or `Tab` to select an option,
+`Space` / `Enter` to toggle, `Ctrl+S` to save, or `Esc` to cancel.
+
+- **Show all databases** (on): show all connectable, non-template databases.
+  Turn off to show only the database saved in each connection.
+- **Show system schemas** (off): show `pg_catalog`, `information_schema`, and
+  other `pg_*` schemas except utility schemas.
+- **Show utility schemas** (off): show `pg_temp_*` and `pg_toast*` schemas.
+
+Settings apply to all connections and are saved in `settings.toml` beside
+`connections.toml`. Explorer visibility changes immediately. Hidden database
+sessions and SQL results stay open.
 
 ## Edit rows
 

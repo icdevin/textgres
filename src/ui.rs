@@ -367,6 +367,12 @@ fn draw_shortcuts(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
   if let Some(overlay) = &app.workspace.overlay {
     return match overlay {
+      Overlay::Settings { .. } => vec![
+        ("↑↓", "setting"),
+        ("Space", "toggle"),
+        ("^S", "save"),
+        ("Esc", "cancel"),
+      ],
       Overlay::Connection(form) if form.selected_field().is_toggle() => {
         vec![
           ("Space", "toggle"),
@@ -425,6 +431,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("^PgUp/Down", "session"),
       ("Tab", "pane"),
       ("^Q", "quit"),
+      ("F2", "settings"),
     ];
   }
 
@@ -445,6 +452,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
         },
       ),
       ("^←/^→", "width"),
+      ("F2", "settings"),
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
@@ -457,6 +465,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("^S", "save"),
       ("^L", "load"),
       ("^↑/^↓", "height"),
+      ("F2", "settings"),
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
@@ -478,6 +487,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
         ("^S", "save all"),
         ("^Z", "discard all"),
         ("F5", "rerun query"),
+        ("F2", "settings"),
         ("Tab", "pane"),
         ("^Q", "quit"),
       ]
@@ -493,6 +503,7 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("^S", "save all"),
       ("^Z", "discard all"),
       ("F5", "refresh"),
+      ("F2", "settings"),
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
@@ -520,6 +531,44 @@ fn shortcut_line(shortcuts: &[(&'static str, &'static str)]) -> Line<'static> {
 
 fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
   match overlay {
+    Overlay::Settings { draft, selected } => {
+      let area = centered(frame.area(), 80, 12);
+      frame.render_widget(Clear, area);
+      // Each option explains its scope; the list scrolls when terminal height is limited.
+      let options = [
+        (
+          draft.show_all_databases,
+          "Show all databases",
+          "Off: only the database saved in each connection.",
+        ),
+        (
+          draft.show_system_schemas,
+          "Show system schemas",
+          "pg_catalog, information_schema, other pg_* schemas.",
+        ),
+        (
+          draft.show_utility_schemas,
+          "Show utility schemas",
+          "pg_temp_* and pg_toast* schemas.",
+        ),
+      ];
+      let items = options.into_iter().map(|(enabled, label, description)| {
+        ListItem::new(vec![
+          Line::from(format!("[{}] {label}", if enabled { "x" } else { " " })),
+          Line::styled(
+            format!("    {description}"),
+            Style::default().fg(THEME.muted),
+          ),
+          Line::from(""),
+        ])
+      });
+      let list = List::new(items)
+        .block(pane_block(" Settings · all connections ", true))
+        .highlight_style(Style::default().bg(THEME.selection).fg(Color::White))
+        .highlight_symbol("› ");
+      let mut state = ListState::default().with_selected(Some(*selected));
+      frame.render_stateful_widget(list, area, &mut state);
+    }
     Overlay::Connection(form) => {
       let area = centered(frame.area(), 70, 18);
       frame.render_widget(Clear, area);
@@ -903,6 +952,44 @@ mod tests {
     db::{ResultColumn, TableRef, TableResultSource},
     storage::ConnectionProfile,
   };
+
+  // Both standard and narrow terminals must show every setting and the save/cancel controls.
+  #[test]
+  fn renders_settings_dialog_and_shortcuts() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = crate::storage::Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = mpsc::channel();
+    let mut app = App::new(storage, vec![], vec![], runtime.handle().clone(), sender);
+    app.workspace.overlay = Some(Overlay::Settings {
+      draft: app.settings,
+      selected: 2,
+    });
+    for (width, height) in [(80, 24), (40, 20)] {
+      let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+      terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+      let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+      // Wrapped shortcut labels remain readable even when separated by terminal padding.
+      let screen = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+      for label in [
+        "[x] Show all databases",
+        "[ ] Show system schemas",
+        "[ ] Show utility schemas",
+        "^S save",
+        "Esc cancel",
+      ] {
+        assert!(screen.contains(label), "missing {label} at {width} columns");
+      }
+    }
+  }
 
   #[test]
   fn renders_the_complete_exploration_workspace() {

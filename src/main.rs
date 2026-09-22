@@ -28,9 +28,12 @@ async fn main() -> anyhow::Result<()> {
   let scripts = storage
     .list_scripts()
     .context("could not list saved SQL scripts")?;
+  // Read preferences before terminal setup so invalid configuration has a visible error.
+  let settings = storage.load_settings().context("could not load settings")?;
   let (database_tx, database_rx) = mpsc::channel();
   let runtime = tokio::runtime::Handle::current();
   let mut app = App::new(storage, profiles, scripts, runtime, database_tx);
+  app.settings = settings;
 
   let _keyboard_enhancement = KeyboardEnhancementGuard::enable();
   let result = ratatui::run(|terminal| run(terminal, &mut app, database_rx));
