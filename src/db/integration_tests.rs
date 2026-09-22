@@ -197,6 +197,40 @@ async fn cancellation_before_connect_does_not_start_io() {
   assert!(result.err().unwrap().is::<Cancelled>());
 }
 
+// Schema browsing hides actual backend temporary schemas without hiding similar user names.
+#[tokio::test]
+#[ignore = "requires local initdb and pg_ctl binaries"]
+async fn postgres_schema_list_hides_temporary_schemas() {
+  let database = TestDatabase::start();
+  let observer = database.connect().await;
+  observer
+    .client
+    .batch_execute(
+      "CREATE SCHEMA app; CREATE SCHEMA pgxtempx1; CREATE TEMP TABLE probe (value text)",
+    )
+    .await
+    .unwrap();
+  let temporary_schema: String = observer
+    .client
+    .query_one(
+      "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()",
+      &[],
+    )
+    .await
+    .unwrap()
+    .get(0);
+  assert!(temporary_schema.starts_with("pg_temp_"));
+  let (_task, receiver) = database.dispatch(Request::Schemas {
+    profile: database.profile.clone(),
+    password: None,
+    database: "postgres".into(),
+  });
+  let Output::Schemas { names, .. } = response(&receiver).await.unwrap() else {
+    panic!("expected schema list");
+  };
+  assert_eq!(names, vec!["app", "pgxtempx1", "public"]);
+}
+
 // A delayed write must not commit after the user cancels it.
 #[tokio::test]
 #[ignore = "requires local initdb and pg_ctl binaries"]
