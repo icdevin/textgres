@@ -250,6 +250,8 @@ pub struct RowDetail {
   pub defaults: Vec<bool>,
   pub is_new: bool,
   pub read_only: bool,
+  // Retain the query-specific reason when opening a read-only row.
+  pub read_only_reason: Option<String>,
   pub selected: usize,
   pub editing: bool,
   pub editor: TextArea<'static>,
@@ -267,6 +269,7 @@ impl RowDetail {
       defaults: vec![false; values.len()],
       is_new: false,
       read_only: false,
+      read_only_reason: result.read_only_reason.clone(),
       values,
       selected: 0,
       editing: false,
@@ -292,6 +295,7 @@ impl RowDetail {
 
   pub fn row_is_editable(&self) -> bool {
     !self.read_only
+      && self.read_only_reason.is_none()
       && self.source.as_ref().is_some_and(|source| {
         matches!(source.table.kind.as_str(), "table" | "partitioned table")
           && (self.is_new || source.columns.iter().any(|column| column.primary_key))
@@ -1089,7 +1093,17 @@ impl App {
         form.is_new = true;
         form.defaults = defaults.clone();
       }
-      form.read_only = self.workspace.edits.uncertain
+      // Query edits require the same live session and an application-owned transaction.
+      let query_unavailable = form
+        .source
+        .as_ref()
+        .is_some_and(|source| source.query.is_some())
+        && !matches!(
+          self.workspace.session_state,
+          db::SessionState::Connected(db::TransactionState::Idle | db::TransactionState::Paging)
+        );
+      form.read_only = query_unavailable
+        || self.workspace.edits.uncertain
         || self.workspace.database_task.is_some()
         || self.workspace.edits.deleted.contains(&form.row_index);
       // Keep the large multiline editor outside the compact overlay enum.
@@ -1106,6 +1120,21 @@ impl App {
       return;
     }
     self.workspace.fetching_page = matches!(request, Request::FetchPage { .. });
+    // The backend retires query authority even if replacement SQL or reconnect later fails.
+    if matches!(
+      request,
+      Request::Query { .. }
+        | Request::Preview { .. }
+        | Request::Disconnect { .. }
+        | Request::Connect {
+          reconnect: true,
+          ..
+        }
+    ) {
+      self.workspace.retire_query_result(
+        "Query result is no longer current; press F5 in Results to rerun the original query",
+      );
+    }
     // Starting a replacement retires the old cursor even if the new operation later fails.
     if matches!(
       request,
@@ -1357,6 +1386,9 @@ fn row_value_editor(value: Option<&str>) -> TextArea<'static> {
 
 fn row_read_only_reason(form: &RowDetail) -> String {
   // A frozen or deleted row must not be described as a generated-column restriction.
+  if let Some(reason) = &form.read_only_reason {
+    return reason.clone();
+  }
   if form.read_only {
     return "This row is read-only while deleted, busy, or awaiting save verification".into();
   }
@@ -1369,7 +1401,7 @@ fn row_read_only_reason(form: &RowDetail) -> String {
   if !form.is_new && !source.columns.iter().any(|column| column.primary_key) {
     return "This table has no primary key; the row is read-only".into();
   }
-  "This generated column is read-only".into()
+  "This generated or computed column is read-only".into()
 }
 
 // Edits at Unicode scalar boundaries so non-ASCII input cannot corrupt a field.
@@ -1436,6 +1468,8 @@ mod tests {
   mod explorer_sessions;
   // Saved script tests exercise confirmation and disk failures without a database.
   mod scripts;
+  // Query editing tests cover the UI's capability and explicit-refresh boundaries.
+  mod query_edits;
   use super::*;
   use ratatui::crossterm::event::KeyEvent;
 
@@ -1849,6 +1883,7 @@ mod tests {
         Some("generated".into()),
       ]],
       source: Some(db::TableResultSource {
+        query: None,
         table: TableRef {
           profile_id: "local".into(),
           database: "postgres".into(),

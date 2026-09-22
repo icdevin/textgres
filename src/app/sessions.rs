@@ -168,6 +168,9 @@ impl App {
       {
         workspace.session_state = state;
         if state == db::SessionState::Lost {
+          workspace.retire_query_result(
+            "SQL session lost; reconnect and rerun the original query before editing",
+          );
           workspace.status = "SQL session lost; reconnect explicitly. Any uncommitted transaction is lost; a recent write outcome may be unknown.".into();
           workspace.status_is_error = true;
         }

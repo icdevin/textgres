@@ -639,3 +639,6 @@ mod paging;
 
 // Explorer disconnect tests drive actual key handling and PostgreSQL connection lifetimes.
 mod explorer_sessions;
+
+// Custom-result writes reuse the cursor and retained-session fixtures.
+mod query_edits;

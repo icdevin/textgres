@@ -34,9 +34,12 @@ mod sessions;
 mod changes;
 // Server cursors keep result transfer bounded without rerunning SQL for each page.
 mod paging;
+// Query provenance is separate from display labels and table-preview metadata.
+mod query_edits;
 pub use changes::{RowChange, UnknownCommit};
 pub use paging::PageRef;
 pub(crate) use paging::page_status;
+pub use query_edits::QuerySource;
 pub use sessions::{SessionManager, SessionState, TransactionState};
 
 const MAX_RESULT_ROWS: usize = 500;
@@ -67,6 +70,8 @@ pub struct ResultColumn {
 /// Direct table previews retain the source needed for safe row updates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableResultSource {
+  // Present only for validated custom SELECT results; these permit updates only.
+  pub query: Option<Box<QuerySource>>,
   pub table: TableRef,
   pub columns: Vec<ResultColumn>,
 }
@@ -74,6 +79,8 @@ pub struct TableResultSource {
 /// The bounded table model rendered by the results pane.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueryResult {
+  // Explain missing keys and unsupported query shapes in the row editor.
+  pub read_only_reason: Option<String>,
   pub columns: Vec<String>,
   pub rows: Vec<Vec<Option<String>>>,
   pub status: String,
@@ -154,6 +161,8 @@ pub enum Output {
   Result(QueryResult),
   // The write is committed even when its separate preview refresh fails.
   Saved(anyhow::Result<QueryResult>),
+  // Custom SELECTs are never rerun implicitly after a committed update.
+  QuerySaved,
   Page {
     requested: PageRef,
     result: QueryResult,
@@ -682,7 +691,7 @@ async fn execute(
                          WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' \
                          WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' \
                          WHEN 'f' THEN 'foreign table' ELSE c.relkind::text END \
-                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     FROM pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
                      WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
                      ORDER BY c.relname",
           &[&schema],
@@ -729,7 +738,11 @@ async fn preview_table(
     .map(|column| &column.name)
     .eq(&result.columns)
   {
-    result.source = Some(TableResultSource { table, columns });
+    result.source = Some(TableResultSource {
+      query: None,
+      table,
+      columns,
+    });
   }
   Ok(result)
 }
@@ -742,12 +755,12 @@ async fn table_columns(
     .run(client.client.query(
       "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
               a.attgenerated = '', \
-              EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid \
+              EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid = c.oid \
                 AND i.indisprimary AND a.attnum = ANY(i.indkey::smallint[])), \
               a.attgenerated = '' AND a.attidentity <> 'a' \
-         FROM pg_class c \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         JOIN pg_attribute a ON a.attrelid = c.oid \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
         WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
         ORDER BY a.attnum",
       &[&table.schema, &table.name],
@@ -830,7 +843,13 @@ fn build_update(
     })
     .collect::<Vec<_>>();
   let sql = format!(
-    "UPDATE {}.{} SET {} WHERE {}",
+    "UPDATE {}{}.{} SET {} WHERE {}",
+    // A child attached after reading must not acquire authority from its parent's key.
+    if source.query.is_some() && source.table.kind == "table" {
+      "ONLY "
+    } else {
+      ""
+    },
     quote_identifier(&source.table.schema),
     quote_identifier(&source.table.name),
     assignments.join(", "),
@@ -996,6 +1015,7 @@ mod tests {
   #[test]
   fn builds_primary_key_update_with_typed_parameters() {
     let source = TableResultSource {
+      query: None,
       table: TableRef {
         profile_id: "local".into(),
         database: "postgres".into(),

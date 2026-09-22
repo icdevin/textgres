@@ -114,14 +114,28 @@ impl App {
     if self.workspace.edits.uncertain {
       return Err("Save outcome is unknown; refresh and verify the table first".into());
     }
+    if let Some(reason) = &self.workspace.result.read_only_reason {
+      return Err(reason.clone());
+    }
     let source = self
       .workspace
       .result
       .source
       .clone()
-      .ok_or("Select a table preview to edit rows")?;
+      .ok_or("Select a table preview or a query with its full primary key to edit rows")?;
     if !matches!(source.table.kind.as_str(), "table" | "partitioned table") {
       return Err("This object is read-only".into());
+    }
+    // A retained query result cannot write after disconnect or inside a user transaction.
+    if source.query.is_some()
+      && !matches!(
+        self.workspace.session_state,
+        db::SessionState::Connected(db::TransactionState::Idle | db::TransactionState::Paging)
+      )
+    {
+      return Err(
+        "Reconnect or end the SQL transaction, then run the query again before editing".into(),
+      );
     }
     Ok(source)
   }
@@ -129,6 +143,11 @@ impl App {
   // New columns start at DEFAULT, which preserves identity, generated values, and server defaults.
   pub(super) fn add_row(&mut self) -> Result<(), String> {
     let source = self.editable_source()?;
+    // Custom projections support updates only; use a table preview for inserts and deletes.
+    if source.query.is_some() {
+      return Err("Custom query results support updates only".into());
+    }
+
     self.workspace.edits.begin(&self.workspace.result);
     self
       .workspace
@@ -153,6 +172,11 @@ impl App {
   // Existing rows stay visible in red; deleting a new row simply removes the pending insert.
   pub(super) fn delete_row(&mut self) -> Result<(), String> {
     let source = self.editable_source()?;
+    // Custom projections support updates only; use a table preview for inserts and deletes.
+    if source.query.is_some() {
+      return Err("Custom query results support updates only".into());
+    }
+
     let row = self.workspace.result_row;
     if self.workspace.result.rows.get(row).is_none() {
       return Err("Select a row to delete".into());
@@ -239,7 +263,12 @@ impl App {
       .profile(&source.table.profile_id)
       .cloned()
       .ok_or("The source connection no longer exists")?;
-    self.workspace.refresh_table = Some(source.table.clone());
+    if let Some(query) = &source.query {
+      self.workspace.refresh_query = Some((source.table.clone(), query.sql.clone()));
+      self.workspace.refresh_table = None;
+    } else {
+      self.workspace.refresh_table = Some(source.table.clone());
+    }
     self.dispatch(
       format!("Saving {} row change(s)", changes.len()),
       Request::SaveChanges {
@@ -277,10 +306,33 @@ impl App {
     }
   }
 
-  // Refresh rereads the original table; custom SQL is never rerun implicitly because it may write.
+  // Refresh explicitly reruns the original source after resolving pending or uncertain edits.
   pub(super) fn refresh_results(&mut self, confirmed: bool) -> Result<(), String> {
     if self.workspace.database_task.is_some() {
       return Err("Wait for this workspace's operation to finish".into());
+    }
+    // This is an explicit rerun; saving never executes custom SQL a second time.
+    if let Some((table, sql)) = self.workspace.refresh_query.clone() {
+      if !confirmed
+        && (self.workspace.edits.count(&self.workspace.result) > 0
+          || self.workspace.edits.uncertain)
+      {
+        self.workspace.overlay = Some(Overlay::ConfirmRefresh);
+        return Ok(());
+      }
+      let profile = self
+        .profile(&table.profile_id)
+        .cloned()
+        .ok_or("The source connection no longer exists")?;
+      self.dispatch(
+        "Rerunning original query".into(),
+        Request::Query {
+          profile,
+          database: table.database,
+          sql,
+        },
+      );
+      return Ok(());
     }
     let table = self
       .workspace

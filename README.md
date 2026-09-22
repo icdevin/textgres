@@ -48,7 +48,7 @@ The bottom bar shows available actions. `^` means `Ctrl`.
 | Script picker | `d` / `Delete` | Delete a saved script after confirmation |
 | Results | `n` / `e` / `d` | Add / edit / mark a row for deletion |
 | Results | `Ctrl+S` / `Ctrl+Z` | Save / discard all pending changes |
-| Results | `F5` | Refresh the table preview |
+| Results | `F5` | Refresh the table preview / rerun the original editable query |
 
 In the script picker, confirm deletion with `y` or `Enter`; cancel with `n` or
 `Esc`. Deletion removes the saved file and keeps the SQL editor text.
@@ -61,8 +61,18 @@ batch, or `Ctrl+Z` to discard it.
 
 New rows are **green**, deleted rows **red**, and changed cells **yellow**.
 Use `Ctrl+N` for `NULL`, or `Ctrl+D` for a new field's database default.
-Updates and deletes require a primary key; views and custom SQL results are read-only.
-Table edits save separately from transactions you start in the SQL editor.
+Updates and deletes require a primary key; views are read-only.
+Table preview edits save separately from transactions you start in the SQL editor.
+
+Custom SQL results support **updates only** for a single-table `SELECT` that
+includes the full primary key. Aliases, column subsets, filters, sorting, and
+limits are supported; computed and generated columns stay read-only.
+
+Joins, CTEs, subqueries, grouping, `DISTINCT`, set operations, function calls,
+duplicate source columns, inheritance parents, and explicit transactions disable
+custom edits. Saves use the original SQL session. After saving, press `F5` in
+Results to rerun the original query. Conflicts roll back the batch; unknown save
+outcomes require refresh and verification.
 
 ## Connections
 

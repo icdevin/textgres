@@ -64,9 +64,57 @@ struct Session {
   pid: i32,
   state: SessionState,
   cursor: Option<paging::Cursor>,
+  // Only the current result may write through this exact SQL session.
+  edit_source: Option<TableResultSource>,
 }
 
 impl Session {
+  // Keep custom updates on the originating connection and retire committed snapshots.
+  async fn save_query(
+    &mut self,
+    profile: &ConnectionProfile,
+    source: &TableResultSource,
+    changes: &[RowChange],
+    cancellation: &Arc<Cancellation>,
+  ) -> anyhow::Result<Output> {
+    anyhow::ensure!(
+      &self.profile == profile && self.edit_source.as_ref() == Some(source),
+      "Query result is no longer current; run the query again"
+    );
+    anyhow::ensure!(
+      matches!(
+        self.state,
+        SessionState::Connected(TransactionState::Idle | TransactionState::Paging)
+      ),
+      "End the SQL transaction and run the query again before editing"
+    );
+    if let Some(cursor) = self.cursor.take() {
+      anyhow::ensure!(
+        cursor.owns_transaction,
+        "Cannot save inside a user transaction"
+      );
+      cursor
+        .close(self.connection.as_ref().expect("connected session"))
+        .await?;
+    }
+    let connection = self
+      .connection
+      .as_mut()
+      .ok_or_else(|| anyhow::anyhow!("SQL session lost; reconnect and run the query again"))?;
+    connection.cancellation = cancellation.clone();
+    let saved = changes::save(connection, source, changes).await;
+    // Never retry a committed or uncertain write with the old row snapshot.
+    if saved.is_ok()
+      || saved
+        .as_ref()
+        .is_err_and(|error| error.is::<UnknownCommit>())
+    {
+      self.edit_source = None;
+    }
+    saved?;
+    Ok(Output::QuerySaved)
+  }
+
   // Idle network loss must invalidate the session even without another SQL execution.
   fn check_health(&mut self) {
     if self.connection.as_ref().is_some_and(|connection| {
@@ -74,6 +122,7 @@ impl Session {
     }) {
       self.connection = None;
       self.cursor = None;
+      self.edit_source = None;
       self.state = SessionState::Lost;
     }
   }
@@ -169,7 +218,7 @@ impl SessionManager {
         password,
         source,
         changes,
-      } => {
+      } if source.query.is_none() => {
         self
           .previews
           .remove(&source.table.profile_id, &source.table.database);
@@ -217,6 +266,10 @@ impl SessionManager {
     }
     let (profile_id, database) = match &request {
       Request::FetchPage { page } => (page.profile_id.clone(), page.database.clone()),
+      Request::SaveChanges { source, .. } => (
+        source.table.profile_id.clone(),
+        source.table.database.clone(),
+      ),
       Request::Query {
         profile, database, ..
       }
@@ -241,7 +294,10 @@ impl SessionManager {
       if let Some(entry) = entries.get(&key) {
         (entry.clone(), false)
       } else {
-        if matches!(request, Request::FetchPage { .. }) {
+        if matches!(
+          request,
+          Request::FetchPage { .. } | Request::SaveChanges { .. }
+        ) {
           return (
             Err(anyhow::anyhow!(
               "SQL result cursor is closed; run the query again"
@@ -263,6 +319,7 @@ impl SessionManager {
           pid: 0,
           state: SessionState::Disconnected,
           cursor: None,
+          edit_source: None,
         }));
         entries.insert(key, entry.clone());
         // A first query may connect lazily, but subsequent failures require explicit reconnect.
@@ -285,6 +342,7 @@ impl SessionManager {
         .try_lock()
         .map_err(|_| anyhow::anyhow!("Wait for the SQL session's operation to finish"))?;
       session.check_health();
+      session.edit_source = None;
       if let Some(cursor) = session.cursor.take()
         && let Some(connection) = &session.connection
       {
@@ -321,6 +379,7 @@ impl SessionManager {
       ensure_not_cancelled(&cancellation.requested)?;
       if let Request::Disconnect { .. } = request {
         session.cursor = None;
+        session.edit_source = None;
         session.connection = None;
         session.state = SessionState::Disconnected;
         return Ok(Output::Session);
@@ -348,6 +407,17 @@ impl SessionManager {
           result,
         });
       }
+      if let Request::SaveChanges {
+        profile,
+        source,
+        changes,
+        ..
+      } = &request
+      {
+        return session
+          .save_query(profile, source, changes, cancellation)
+          .await;
+      }
       let (profile, explicit, reconnect) = match &request {
         Request::Query { profile, .. }
         | Request::Databases { profile, .. }
@@ -363,6 +433,7 @@ impl SessionManager {
       );
       if reconnect {
         session.cursor = None;
+        session.edit_source = None;
         session.connection = None;
         session.state = SessionState::Disconnected;
       }
@@ -385,6 +456,10 @@ impl SessionManager {
           .get(0);
         session.connection = Some(connection);
         session.state = SessionState::Connected(TransactionState::Idle);
+      }
+      // Even failed replacement SQL retires the old result's write authority.
+      if matches!(request, Request::Query { .. }) {
+        session.edit_source = None;
       }
       // Close our earlier cursor before user SQL, including BEGIN/COMMIT/ROLLBACK.
       if matches!(request, Request::Query { .. })
@@ -427,14 +502,24 @@ impl SessionManager {
             );
             let result = async {
               cursor.open(connection, &statement).await?;
-              cursor.fetch(connection).await
+              let mut result = cursor.fetch(connection).await?;
+              query_edits::attach(
+                connection,
+                &statement,
+                &cursor.page,
+                cursor.owns_transaction,
+                &mut result,
+              )
+              .await?;
+              Ok(result)
             }
             .await;
-            let result = cursor.finish(connection, result).await;
-            if result.as_ref().is_ok_and(|result| result.page.is_some()) {
+            let result = cursor.finish(connection, result).await?;
+            session.edit_source = result.source.clone();
+            if result.page.is_some() {
               session.cursor = Some(cursor);
             }
-            Ok(Output::Result(result?))
+            Ok(Output::Result(result))
           } else {
             Ok(Output::Result(run_query(connection, &sql).await?))
           }

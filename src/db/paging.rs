@@ -249,6 +249,7 @@ impl Previews {
       .eq(result.columns.iter())
     {
       result.source = Some(TableResultSource {
+        query: None,
         table: table.clone(),
         columns,
       });

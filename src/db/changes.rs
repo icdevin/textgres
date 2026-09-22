@@ -1,4 +1,4 @@
-// Batch writes use one dedicated transaction, separate from the SQL editor's session.
+// Batch writes own one transaction; custom results retain their originating SQL connection.
 use super::*;
 
 // A false default flag with a None value means SQL NULL; true lets PostgreSQL supply DEFAULT.
@@ -65,9 +65,14 @@ pub(super) async fn save(
         quote_identifier(&source.table.name)
       )))
       .await?;
+    query_edits::validate(client, source).await?;
+    // Projection results do not define insertion defaults or full-row deletion semantics.
     anyhow::ensure!(
-      table_columns(client, &source.table).await? == source.columns,
-      "Table definition changed; refresh before editing"
+      source.query.is_none()
+        || changes
+          .iter()
+          .all(|change| matches!(change, RowChange::Update { .. })),
+      "Custom query results support updates only"
     );
     for change in changes {
       let (sql, parameters) = statement(source, change)?;
@@ -86,12 +91,7 @@ pub(super) async fn save(
   .await;
   if let Err(error) = write {
     // Cancellation blocks supervised work, so rollback uses its own bounded cleanup attempt.
-    // The owning worker drops the connection on return even if this rollback cannot complete.
-    let _ = tokio::time::timeout(
-      CANCELLATION_TIMEOUT,
-      client.client.batch_execute("ROLLBACK"),
-    )
-    .await;
+    rollback(client).await;
     return Err(error).context("Batch not committed");
   }
   // Only losing the COMMIT response leaves the batch's outcome uncertain.
@@ -99,11 +99,7 @@ pub(super) async fn save(
     if client.broken.load(Ordering::SeqCst) {
       return Err(UnknownCommit(error).into());
     }
-    let _ = tokio::time::timeout(
-      CANCELLATION_TIMEOUT,
-      client.client.batch_execute("ROLLBACK"),
-    )
-    .await;
+    rollback(client).await;
     return Err(error).context("Batch not committed");
   }
   Ok(())
@@ -174,5 +170,19 @@ fn statement(
       };
       Ok((sql, parameters))
     }
+  }
+}
+
+// A retained SQL connection must never survive uncertain transaction cleanup.
+async fn rollback(client: &DatabaseConnection) {
+  if !matches!(
+    tokio::time::timeout(
+      CANCELLATION_TIMEOUT,
+      client.client.batch_execute("ROLLBACK")
+    )
+    .await,
+    Ok(Ok(()))
+  ) {
+    client.broken.store(true, Ordering::SeqCst);
   }
 }

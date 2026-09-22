@@ -172,7 +172,18 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
   // Use the result's known object, never the currently selected Explorer row or SQL text.
   let mut title = app.workspace.result.source.as_ref().map_or_else(
     || " SQL results ".to_owned(),
-    |source| format!(" Results · {}.{} ", source.table.schema, source.table.name),
+    |source| {
+      format!(
+        " {} · {}.{} ",
+        if source.query.is_some() {
+          "SQL results"
+        } else {
+          "Results"
+        },
+        source.table.schema,
+        source.table.name
+      )
+    },
   );
   // Pending rows remain visible until the complete batch is saved or discarded.
   let changes = app.workspace.edits.count(&app.workspace.result);
@@ -449,6 +460,28 @@ fn shortcuts(app: &App) -> Vec<(&'static str, &'static str)> {
       ("Tab", "pane"),
       ("^Q", "quit"),
     ],
+    // Custom results expose update and explicit rerun actions without insertion/deletion hints.
+    Focus::Results
+      if app.workspace.refresh_query.is_some()
+        || app
+          .workspace
+          .result
+          .source
+          .as_ref()
+          .is_some_and(|source| source.query.is_some()) =>
+    {
+      vec![
+        ("PgUp/Dn", "scroll"),
+        ("↑↓", "rows"),
+        ("←→", "columns"),
+        ("e", "edit"),
+        ("^S", "save all"),
+        ("^Z", "discard all"),
+        ("F5", "rerun query"),
+        ("Tab", "pane"),
+        ("^Q", "quit"),
+      ]
+    }
     Focus::Results => vec![
       ("PgUp/Dn", "scroll"),
       ("↑↓", "rows"),
@@ -616,7 +649,7 @@ fn draw_overlay(frame: &mut Frame<'_>, overlay: &Overlay, scripts: &[String]) {
       // Refresh must not silently replace staged values with database values.
       let area = centered(frame.area(), 70, 7);
       frame.render_widget(Clear, area);
-      frame.render_widget(Paragraph::new("Discard pending table changes and refresh from the database? If the last save outcome was unknown, verify the refreshed data before editing. Y: refresh · N/Esc: keep changes").wrap(Wrap { trim: false }).block(pane_block(" Refresh table? ", true).padding(Padding::uniform(1))), area);
+      frame.render_widget(Paragraph::new("Discard pending changes and refresh the original results? If the last save outcome was unknown, verify the refreshed data before editing. Y: refresh · N/Esc: keep changes").wrap(Wrap { trim: false }).block(pane_block(" Refresh table? ", true).padding(Padding::uniform(1))), area);
     }
     Overlay::ConfirmExplorerDisconnect { label, .. } => {
       let area = centered(frame.area(), 70, 8);
@@ -931,6 +964,7 @@ mod tests {
     app.workspace.result.rows = vec![vec![Some("1".into()), Some("dev@example.com".into()), None]];
     // Source metadata makes the table-preview row safe to edit.
     app.workspace.result.source = Some(TableResultSource {
+      query: None,
       table: TableRef {
         profile_id: "local".into(),
         database: "postgres".into(),
@@ -1230,6 +1264,7 @@ mod tests {
       vec![Some("2".into()), None],
     ];
     app.workspace.result.source = Some(TableResultSource {
+      query: None,
       table: TableRef {
         profile_id: "local".into(),
         database: "postgres".into(),

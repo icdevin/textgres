@@ -2,7 +2,7 @@
 use super::*;
 
 // Keep one manager across initial execution and later pages, just like an application workspace.
-async fn execute(
+pub(super) async fn execute(
   manager: &SessionManager,
   request: Request,
 ) -> (anyhow::Result<Output>, Option<SessionState>) {
@@ -16,7 +16,7 @@ async fn execute(
 }
 
 // Extract both initial and appended row sets while preserving database errors.
-fn rows(output: anyhow::Result<Output>) -> QueryResult {
+pub(super) fn rows(output: anyhow::Result<Output>) -> QueryResult {
   match output.unwrap() {
     Output::Result(result) | Output::Page { result, .. } => result,
     other => panic!("expected rows, got {other:?}"),
@@ -24,7 +24,7 @@ fn rows(output: anyhow::Result<Output>) -> QueryResult {
 }
 
 // SQL reads use the existing session, including temporary objects and session settings.
-fn query(database: &TestDatabase, sql: &str) -> Request {
+pub(super) fn query(database: &TestDatabase, sql: &str) -> Request {
   Request::Query {
     profile: database.profile.clone(),
     database: "postgres".into(),

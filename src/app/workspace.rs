@@ -15,6 +15,8 @@ pub struct Workspace {
   pub edits: table_edits::TableEdits,
   // Preserve the refresh target if a committed batch loses its follow-up preview.
   pub(super) refresh_table: Option<TableRef>,
+  // F5 explicitly reruns the saved query, even after its write authority is retired.
+  pub(crate) refresh_query: Option<(TableRef, String)>,
   pub(super) database_task: Option<db::Task>,
   // A failed FETCH cannot be retried because the server may already have advanced its cursor.
   pub(super) fetching_page: bool,
@@ -35,6 +37,7 @@ impl Default for Workspace {
       session_state: db::SessionState::Disconnected,
       edits: table_edits::TableEdits::default(),
       refresh_table: None,
+      refresh_query: None,
       database_task: None,
       fetching_page: false,
     }
@@ -42,6 +45,19 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+  // Keep drafts and the refresh target, but never advertise a retired query snapshot as editable.
+  pub(super) fn retire_query_result(&mut self, reason: &str) {
+    if self
+      .result
+      .source
+      .as_ref()
+      .is_some_and(|source| source.query.is_some())
+    {
+      self.result.read_only_reason = Some(reason.into());
+      self.result.page = None;
+    }
+  }
+
   /// Applies output only when it belongs to the active operation.
   pub(super) fn apply_database_response(&mut self, response: Response) {
     if self
@@ -57,6 +73,14 @@ impl Workspace {
     let fetched_page = std::mem::take(&mut self.fetching_page);
     if let Some(state) = response.session_state {
       self.session_state = state;
+      if matches!(
+        state,
+        db::SessionState::Disconnected | db::SessionState::Lost
+      ) {
+        self.retire_query_result(
+          "SQL session disconnected or lost; reconnect and rerun the original query before editing",
+        );
+      }
       // Explicit disconnect closes all cursors; SQL loss alone leaves independent previews intact.
       if state == db::SessionState::Disconnected
         || (state == db::SessionState::Lost
@@ -105,12 +129,34 @@ impl Workspace {
       }
       Ok(Output::Result(result)) => {
         let status = result.status.clone();
-        self.refresh_table = result.source.as_ref().map(|source| source.table.clone());
+        self.refresh_query = result.source.as_ref().and_then(|source| {
+          source
+            .query
+            .as_ref()
+            .map(|query| (source.table.clone(), query.sql.clone()))
+        });
+        self.refresh_table = result
+          .source
+          .as_ref()
+          .filter(|source| source.query.is_none())
+          .map(|source| source.table.clone());
         self.edits = table_edits::TableEdits::default();
         self.result = result;
         self.result_row = 0;
         self.result_column = 0;
         self.focus = Focus::Results;
+        self.set_status(status, false);
+      }
+      Ok(Output::QuerySaved) => {
+        // Displayed values may differ from trigger output, expressions, filters, and ordering.
+        self.edits = table_edits::TableEdits::default();
+        self.result.source = None;
+        self.result.page = None;
+        let status =
+          "Changes saved; results are stale. Press F5 in Results to rerun the original query"
+            .to_owned();
+        self.result.read_only_reason = Some(status.clone());
+        self.result.status = status.clone();
         self.set_status(status, false);
       }
       Ok(Output::Saved(result)) => {
@@ -185,6 +231,13 @@ impl Workspace {
       .is_some_and(|table| table.profile_id == profile_id)
     {
       self.refresh_table = None;
+    }
+    if self
+      .refresh_query
+      .as_ref()
+      .is_some_and(|(table, _)| table.profile_id == profile_id)
+    {
+      self.refresh_query = None;
     }
     if matches!(&self.overlay, Some(Overlay::RowDetail(form)) if from_profile(&form.source)) {
       self.overlay = None;
