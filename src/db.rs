@@ -20,7 +20,7 @@ use native_tls::TlsConnector;
 use postgres_native_tls::MakeTlsConnector;
 use tokio::{runtime::Handle, sync::Notify, task::JoinHandle};
 use tokio_postgres::{
-  Config, SimpleQueryMessage,
+  Config, NoTls, SimpleQueryMessage,
   config::SslMode,
   error::{DbError, ErrorPosition},
   types::ToSql,
@@ -247,7 +247,8 @@ impl Drop for Task {
 struct DatabaseConnection {
   client: tokio_postgres::Client,
   driver: JoinHandle<()>,
-  tls: MakeTlsConnector,
+  // Plaintext sessions need no certificate store, including for cancellation.
+  tls: Option<MakeTlsConnector>,
   cancellation: Arc<Cancellation>,
   broken: AtomicBool,
 }
@@ -272,12 +273,19 @@ impl DatabaseConnection {
       () = self.cancellation.wait() => {
         let token = self.client.cancel_token();
         let mut cancel_error = None;
+        // Cancel with the same transport policy as the original SQL connection.
+        let cancel = async {
+          match &self.tls {
+            Some(tls) => token.cancel_query(tls.clone()).await,
+            None => token.cancel_query(NoTls).await,
+          }
+        };
         // The original response, not successful delivery of CancelRequest, is authoritative.
         let completion = async {
           tokio::select! {
             biased;
             result = &mut work => result,
-            sent = token.cancel_query(self.tls.clone()) => {
+            sent = cancel => {
               cancel_error = sent.err();
               work.await
             }
@@ -913,13 +921,27 @@ async fn connect_inner(
     config.password(password);
   }
 
-  // Native roots verify remote PostgreSQL certificates when TLS is required.
-  let tls = MakeTlsConnector::new(TlsConnector::builder().build()?);
-  let (client, connection) = config.connect(tls.clone()).await?;
-  let driver = tokio::spawn(async move {
-    // Query futures receive connection failures; no terminal output is safe here.
-    let _ = connection.await;
-  });
+  // Loading native roots is expensive; plaintext connections never need a TLS context.
+  let tls = if profile.require_tls {
+    Some(MakeTlsConnector::new(TlsConnector::builder().build()?))
+  } else {
+    None
+  };
+  let (client, driver) = if let Some(tls) = &tls {
+    let (client, connection) = config.connect(tls.clone()).await?;
+    let driver = tokio::spawn(async move {
+      // Query futures receive connection failures; no terminal output is safe here.
+      let _ = connection.await;
+    });
+    (client, driver)
+  } else {
+    let (client, connection) = config.connect(NoTls).await?;
+    let driver = tokio::spawn(async move {
+      // Keep plaintext drivers under the same ownership and error handling as TLS drivers.
+      let _ = connection.await;
+    });
+    (client, driver)
+  };
   Ok(DatabaseConnection {
     client,
     driver,

@@ -60,7 +60,12 @@ impl SqlEditor {
 
   /// Delegates input so existing textarea navigation and editing remain unchanged.
   pub fn input(&mut self, key: KeyEvent) -> bool {
-    self.textarea.input(key)
+    let changed = self.textarea.input(key);
+    // Navigation changes the viewport, but only text edits invalidate SQL syntax.
+    if changed {
+      self.syntax.get_mut().dirty = true;
+    }
+    changed
   }
 
   /// Exposes the canonical plain text used for execution and script persistence.
@@ -98,6 +103,10 @@ struct StyledRange {
 struct SyntaxHighlighter {
   configuration: HighlightConfiguration,
   highlighter: TreeSitterHighlighter,
+  // Keep byte ranges and line offsets together so scrolling never reparses unchanged SQL.
+  ranges: Vec<StyledRange>,
+  line_offsets: Vec<usize>,
+  dirty: bool,
 }
 
 impl SyntaxHighlighter {
@@ -126,17 +135,28 @@ impl SyntaxHighlighter {
     Self {
       configuration,
       highlighter: TreeSitterHighlighter::new(),
+      ranges: Vec::new(),
+      line_offsets: Vec::new(),
+      dirty: true,
     }
   }
 
-  // Reparse the current buffer on each draw so incomplete edits update immediately.
+  // Refresh syntax after edits, then apply cached styles to the current viewport.
   fn render(&mut self, lines: &[String], textarea: &TextArea<'_>, area: Rect, buffer: &mut Buffer) {
     if area.is_empty() {
       return;
     }
-    let source = lines.join("\n");
-    let ranges = self.highlight_ranges(&source);
-    if ranges.is_empty() {
+    if self.dirty {
+      self.ranges = self.highlight_ranges(&lines.join("\n"));
+      self.line_offsets.clear();
+      let mut offset = 0;
+      for line in lines {
+        self.line_offsets.push(offset);
+        offset += line.len() + 1;
+      }
+      self.dirty = false;
+    }
+    if self.ranges.is_empty() {
       return;
     }
 
@@ -155,12 +175,6 @@ impl SyntaxHighlighter {
       )
     });
 
-    let mut line_offsets = Vec::with_capacity(lines.len());
-    let mut offset = 0;
-    for line in lines {
-      line_offsets.push(offset);
-      offset += line.len() + 1;
-    }
     for visible_row in 0..usize::from(area.height) {
       let row = top_row + visible_row;
       let Some(line) = lines.get(row) else {
@@ -168,8 +182,8 @@ impl SyntaxHighlighter {
       };
       self.style_line(
         line,
-        line_offsets[row],
-        &ranges,
+        self.line_offsets[row],
+        &self.ranges,
         top_column,
         line_number_width,
         Rect::new(area.x, area.y + visible_row as u16, area.width, 1),
@@ -222,6 +236,10 @@ impl SyntaxHighlighter {
     let mut display_column = 0;
     let mut range_index = ranges.partition_point(|range| range.end <= line_offset);
     for (byte_offset, character) in line.char_indices() {
+      // Characters beyond the right edge cannot affect any rendered cell.
+      if line_number_width + display_column >= top_column + usize::from(area.width) {
+        break;
+      }
       let source_offset = line_offset + byte_offset;
       while ranges
         .get(range_index)
@@ -287,9 +305,63 @@ fn capture_style(name: &str) -> Style {
 
 #[cfg(test)]
 mod tests {
+  use ratatui::crossterm::event::{KeyCode, KeyModifiers};
   use ratatui_textarea::CursorMove;
 
   use super::*;
+
+  // Cached syntax must match a fresh parse after multiline edits, Unicode input, undo, and redo.
+  #[test]
+  fn cached_highlights_follow_edits_and_navigation() {
+    let mut editor = SqlEditor::new(vec!["SELECT 'é';".into(), "SELECT 42;".into()]);
+    let area = Rect::new(0, 0, 40, 5);
+    let mut buffer = Buffer::empty(area);
+    (&editor).render(area, &mut buffer);
+    for (code, modifiers) in [
+      (KeyCode::Char('/'), KeyModifiers::NONE),
+      (KeyCode::Char('*'), KeyModifiers::NONE),
+      (KeyCode::Enter, KeyModifiers::NONE),
+      (KeyCode::Char('界'), KeyModifiers::NONE),
+      (KeyCode::Char('u'), KeyModifiers::CONTROL),
+      (KeyCode::Char('r'), KeyModifiers::CONTROL),
+      (KeyCode::Down, KeyModifiers::NONE),
+      (KeyCode::End, KeyModifiers::NONE),
+      (KeyCode::Char('*'), KeyModifiers::NONE),
+      (KeyCode::Char('/'), KeyModifiers::NONE),
+      (KeyCode::Backspace, KeyModifiers::NONE),
+    ] {
+      editor.input(KeyEvent::new(code, modifiers));
+      let mut fresh = SqlEditor::new(editor.lines().to_vec());
+      let cursor = editor.textarea.cursor();
+      fresh
+        .textarea
+        .move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
+      let mut expected = Buffer::empty(area);
+      buffer.reset();
+      (&editor).render(area, &mut buffer);
+      (&fresh).render(area, &mut expected);
+      assert_eq!(buffer, expected, "after {code:?} with {modifiers:?}");
+    }
+  }
+
+  // Scrolling reuses syntax while still applying styles at the new vertical and horizontal origin.
+  #[test]
+  fn cached_highlights_follow_scrolling() {
+    let lines = vec!["SELECT '界', id FROM users WHERE id = 42;".into(); 40];
+    let mut editor = SqlEditor::new(lines.clone());
+    let area = Rect::new(0, 0, 20, 5);
+    (&editor).render(area, &mut Buffer::empty(area));
+    editor.textarea.move_cursor(CursorMove::Bottom);
+    editor.textarea.move_cursor(CursorMove::End);
+    let mut fresh = SqlEditor::new(lines);
+    fresh.textarea.move_cursor(CursorMove::Bottom);
+    fresh.textarea.move_cursor(CursorMove::End);
+    let mut actual = Buffer::empty(area);
+    let mut expected = Buffer::empty(area);
+    (&editor).render(area, &mut actual);
+    (&fresh).render(area, &mut expected);
+    assert_eq!(actual, expected);
+  }
 
   #[test]
   fn highlights_sql_tokens_with_semantic_styles() {

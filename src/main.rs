@@ -4,6 +4,9 @@ mod sql_editor;
 mod storage;
 mod theme;
 mod ui;
+// Keep repeatable performance probes outside production builds.
+#[cfg(test)]
+mod performance;
 
 use std::{io, sync::mpsc, time::Duration};
 

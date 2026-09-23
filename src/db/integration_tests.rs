@@ -585,7 +585,8 @@ async fn postgres_cancellation_preserves_tls_and_routed_endpoint() {
   let client = DatabaseConnection {
     client,
     driver,
-    tls,
+    // Retain the custom trust store for the encrypted cancellation connection.
+    tls: Some(tls),
     cancellation: cancellation.clone(),
     broken: AtomicBool::new(false),
   };
@@ -675,6 +676,39 @@ async fn postgres_cancelled_row_update_preserves_values() {
 // Persistent-session regressions share the isolated cluster fixture.
 mod sessions;
 
+// Plaintext skips TLS setup, while a TLS-required profile must never downgrade to plaintext.
+#[tokio::test]
+#[ignore = "requires local initdb and pg_ctl binaries"]
+async fn postgres_connections_preserve_transport_policy() {
+  let database = TestDatabase::start();
+  let connection = database.connect().await;
+  assert!(connection.tls.is_none());
+  let encrypted: bool = connection
+    .client
+    .query_one(
+      "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+      &[],
+    )
+    .await
+    .unwrap()
+    .get(0);
+  assert!(!encrypted);
+  let mut profile = database.profile.clone();
+  profile.require_tls = true;
+  let result = connect(
+    &profile,
+    None,
+    "postgres",
+    &TunnelManager::default(),
+    &Arc::new(Cancellation::default()),
+  )
+  .await;
+  assert!(
+    result.is_err(),
+    "TLS-required profile connected to a plaintext-only server"
+  );
+}
+
 // Batch-write regressions share the disposable PostgreSQL fixture.
 mod changes;
 
@@ -686,3 +720,6 @@ mod explorer_sessions;
 
 // Custom-result writes reuse the cursor and retained-session fixtures.
 mod query_edits;
+
+// Manual latency probes use disposable data and the actual session execution path.
+mod performance;

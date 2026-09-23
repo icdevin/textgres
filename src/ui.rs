@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
   Frame,
   layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -251,12 +253,18 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
       .add_modifier(Modifier::BOLD),
   )
   .bottom_margin(1);
+  // Table eagerly collects its input; construct cells only for the visible row slice.
+  // Keep absolute row indexes for ordinals and edits, and select relative to this slice.
+  let viewport_height = area.height.saturating_sub(4) as usize;
+  let offset = (app.workspace.result_row + 1).saturating_sub(viewport_height.max(1));
   let rows = app
     .workspace
     .result
     .rows
     .iter()
     .enumerate()
+    .skip(offset)
+    .take(viewport_height)
     .map(|(row, values)| {
       Row::new(
         std::iter::once(Cell::from((row + 1).to_string()).style(Style::default().fg(THEME.muted)))
@@ -288,11 +296,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
       )
     });
   let mut state = TableState::default();
-  state.select(Some(app.workspace.result_row));
-  let viewport_height = area.height.saturating_sub(4) as usize;
-  if app.workspace.result_row >= viewport_height && viewport_height > 0 {
-    *state.offset_mut() = app.workspace.result_row - viewport_height + 1;
-  }
+  state.select(Some(app.workspace.result_row.saturating_sub(offset)));
   let table = Table::new(rows, widths)
     .header(header)
     .block(block)
@@ -303,7 +307,7 @@ fn draw_results(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 // NULL has distinct semantics and should not look like the literal text "NULL".
-fn result_cell(value: Option<&str>) -> Cell<'static> {
+fn result_cell(value: Option<&str>) -> Cell<'_> {
   match value {
     Some(value) => Cell::from(one_line(value)),
     None => Cell::from(Line::styled(
@@ -785,9 +789,9 @@ fn draw_row_detail(frame: &mut Frame<'_>, form: &crate::app::RowDetail) {
     };
     let value = form.values.get(index).and_then(Option::as_deref);
     let value = if form.defaults[index] {
-      "DEFAULT".to_owned()
+      Cow::Borrowed("DEFAULT")
     } else {
-      value.map_or_else(|| "NULL".to_owned(), one_line)
+      value.map_or(Cow::Borrowed("NULL"), one_line)
     };
     ListItem::new(Line::from(vec![
       Span::styled(
@@ -885,11 +889,21 @@ fn centered(area: Rect, percent_x: u16, height: u16) -> Rect {
 }
 
 // Database values may contain newlines, but each table row must remain one terminal row.
-fn one_line(value: &str) -> String {
-  value
-    .replace('\n', "↵")
-    .replace('\r', "")
-    .replace('\t', "⇥")
+fn one_line(value: &str) -> Cow<'_, str> {
+  // Most cells need no conversion; borrow them instead of allocating on every draw.
+  if !value.contains(['\n', '\r', '\t']) {
+    return Cow::Borrowed(value);
+  }
+  let mut text = String::with_capacity(value.len());
+  for character in value.chars() {
+    match character {
+      '\n' => text.push('↵'),
+      '\r' => {}
+      '\t' => text.push('⇥'),
+      _ => text.push(character),
+    }
+  }
+  Cow::Owned(text)
 }
 
 // Returns as many measured columns as fit, always preserving one for narrow terminals.
@@ -922,20 +936,15 @@ fn visible_columns(
 
 // Measures terminal cells, not bytes, and adds one cell of visual breathing room.
 fn column_width(result: &crate::db::QueryResult, index: usize) -> usize {
-  let header_width = result.columns[index].width();
-  let value_width = result
-    .rows
-    .iter()
-    .filter_map(|row| row.get(index))
-    .map(|value| {
-      value
-        .as_deref()
-        .map_or("NULL".width(), |value| one_line(value).width())
-    })
-    .max()
-    .unwrap_or(0);
-  header_width
-    .max(value_width)
+  let mut width = result.columns[index].width();
+  for value in result.rows.iter().filter_map(|row| row.get(index)) {
+    // Once capped, later values cannot change the layout.
+    if width >= MAX_COLUMN_WIDTH - 1 {
+      break;
+    }
+    width = width.max(value.as_deref().map_or(4, |value| one_line(value).width()));
+  }
+  width
     .saturating_add(1)
     .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
 }
@@ -952,6 +961,75 @@ mod tests {
     db::{ResultColumn, TableRef, TableResultSource},
     storage::ConnectionProfile,
   };
+
+  // Result slicing must retain absolute row numbers and selection across page boundaries and resize.
+  #[test]
+  fn result_viewport_preserves_selection_and_offscreen_widths() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = crate::storage::Storage::new(directory.path().to_owned()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .unwrap();
+    let (sender, _receiver) = mpsc::channel();
+    let mut app = App::new(storage, vec![], vec![], runtime.handle().clone(), sender);
+    app.workspace.result.columns = vec!["value".into()];
+    app.workspace.result.rows = (0..405)
+      .map(|index| vec![Some(format!("value{index:03}"))])
+      .collect();
+    // Offscreen data still determines width, so scrolling cannot move column boundaries.
+    app.workspace.result.rows[0][0] = Some("x".repeat(80));
+    assert_eq!(column_width(&app.workspace.result, 0), MAX_COLUMN_WIDTH);
+    for height in [5, 8, 24, 40] {
+      let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+      for selected in [1, 199, 200, 399, 404] {
+        app.workspace.result_row = selected;
+        terminal
+          .draw(|frame| draw_results(frame, &app, frame.area()))
+          .unwrap();
+        let buffer = terminal.backend().buffer();
+        let selected_y = 3 + selected.min(usize::from(height - 5)) as u16;
+        let number = (3..6)
+          .map(|x| buffer[(x, selected_y)].symbol())
+          .collect::<String>();
+        assert_eq!(number.trim(), (selected + 1).to_string());
+        assert_eq!(buffer[(3, selected_y)].bg, THEME.selection);
+        let line = (0..80)
+          .map(|x| buffer[(x, selected_y)].symbol())
+          .collect::<String>();
+        assert!(line.contains(&format!("value{selected:03}")));
+      }
+    }
+    // Tiny panes and empty results must remain safe even with no data-row space.
+    app.workspace.result.rows.clear();
+    app.workspace.result_row = 0;
+    for height in 0..5 {
+      let mut terminal = Terminal::new(TestBackend::new(10, height)).unwrap();
+      terminal
+        .draw(|frame| draw_results(frame, &app, frame.area()))
+        .unwrap();
+    }
+  }
+
+  // Single-pass conversion must retain existing control markers and Unicode display widths.
+  #[test]
+  fn result_text_preserves_control_and_unicode_rendering() {
+    for value in ["", "plain", "é\t界\r\nnext", "e\u{301}", "👩‍💻", "\r\r\t\n"] {
+      let expected = value
+        .replace('\n', "↵")
+        .replace('\r', "")
+        .replace('\t', "⇥");
+      assert_eq!(one_line(value), expected);
+      let result = crate::db::QueryResult {
+        columns: vec!["value".into()],
+        rows: vec![vec![Some(value.into())]],
+        ..Default::default()
+      };
+      assert_eq!(
+        column_width(&result, 0),
+        (expected.width().max(5) + 1).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
+      );
+    }
+  }
 
   // Both standard and narrow terminals must show every setting and the save/cancel controls.
   #[test]
